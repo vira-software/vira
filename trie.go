@@ -84,7 +84,7 @@ var (
 )
 
 // New return a new Trie
-func New(opts ...Options) *Trie {
+func NewTrie(opts ...Options) *Trie {
 	options := defaultOptions
 	if len(opts) > 0 {
 		options = opts[0]
