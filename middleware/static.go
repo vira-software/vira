@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vira-software/vira/v1"
+	"github.com/vira-software/vira"
 )
 
 // StaticOptions is static middleware options

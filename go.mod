@@ -1,3 +1,3 @@
-module github.com/vira-software/vira/v1
+module github.com/vira-software/vira
 
 go 1.22.1

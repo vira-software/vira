@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/vira-software/vira/v1"
+	"github.com/vira-software/vira"
 )
 
 // NewGrpcMiddleware creates a middleware with gRPC server to Handle gRPC requests.

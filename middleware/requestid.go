@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"math/rand"
 
-	"github.com/vira-software/vira/v1"
+	"github.com/vira-software/vira"
 )
 
 type RequestIdOptions struct {

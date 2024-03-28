@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vira-software/vira/v1"
+	"github.com/vira-software/vira"
 )
 
 // FrameGuardAction represents a possible option of the "X-Frame-Options"
