@@ -1,634 +1,681 @@
 package vira
 
 import (
-	"context"
-	"encoding/json"
-	"encoding/xml"
 	"fmt"
-	"io"
-	"log"
+	"html/template"
 	"net"
 	"net/http"
 	"os"
+	"path"
+	"regexp"
 	"strings"
-	"time"
-	// "golang.org/x/net/http2"
-	// "golang.org/x/net/http2/h2c"
+	"sync"
+
+	bytesconv "github.com/vira-software/vira/internal"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-// Middleware defines a function to process as middleware.
-type Middleware func(ctx *Context) error
+const defaultMultipartMemory = 32 << 20 // 32 MB
 
-// Handler interface is used by vira.UseHandler as a middleware.
-type Handler interface {
-	Serve(ctx *Context) error
+var (
+	default404Body = []byte("404 page not found")
+	default405Body = []byte("405 method not allowed")
+)
+
+var defaultPlatform string
+
+var defaultTrustedCIDRs = []*net.IPNet{
+	{ // 0.0.0.0/0 (IPv4)
+		IP:   net.IP{0x0, 0x0, 0x0, 0x0},
+		Mask: net.IPMask{0x0, 0x0, 0x0, 0x0},
+	},
+	{ // ::/0 (IPv6)
+		IP:   net.IP{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+		Mask: net.IPMask{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+	},
 }
 
-// Sender interface is used by ctx.Send.
-type Sender interface {
-	Send(ctx *Context, code int, data any) error
-}
+var regSafePrefix = regexp.MustCompile("[^a-zA-Z0-9/-]+")
+var regRemoveRepeatedChar = regexp.MustCompile("/{2,}")
 
-// Renderer interface is used by ctx.Render.
-type Renderer interface {
-	Render(ctx *Context, w io.Writer, name string, data any) error
-}
+// HandlerFunc defines the handler used by vira middleware as return value.
+type HandlerFunc func(*Context)
 
-// URLParser interface is used by ctx.ParseUrl. Default to:
-//
-//	vira.Set(vira.SetURLParser, vira.DefaultURLParser)
-type URLParser interface {
-	Parse(val map[string][]string, body any, tag string) error
-}
+// OptionFunc defines the function to change the default configuration
+type OptionFunc func(*Engine)
 
-// DefaultURLParser is default URLParser type.
-type DefaultURLParser struct{}
+// HandlersChain defines a HandlerFunc slice.
+type HandlersChain []HandlerFunc
 
-// Parse implemented URLParser interface.
-func (d DefaultURLParser) Parse(val map[string][]string, body any, tag string) error {
-	return ValuesToStruct(val, body, tag)
-}
-
-// BodyParser interface is used by ctx.ParseBody. Default to:
-//
-//	vira.Set(vira.SetBodyParser, vira.DefaultBodyParser(1<<20))
-type BodyParser interface {
-	// Maximum allowed size for a request body
-	MaxBytes() int64
-	Parse(buf []byte, body any, mediaType, charset string) error
-}
-
-// DefaultBodyParser is default BodyParser type.
-// SetBodyParser used 1MB as default:
-//
-//	vira.Set(vira.SetBodyParser, vira.DefaultBodyParser(1<<20))
-type DefaultBodyParser int64
-
-// MaxBytes implemented BodyParser interface.
-func (d DefaultBodyParser) MaxBytes() int64 {
-	return int64(d)
-}
-
-// Parse implemented BodyParser interface.
-func (d DefaultBodyParser) Parse(buf []byte, body any, mediaType, charset string) error {
-	if len(buf) == 0 {
-		return ErrBadRequest.WithMsg("request entity empty")
+// Last returns the last handler in the chain. i.e. the last handler is the main one.
+func (c HandlersChain) Last() HandlerFunc {
+	if length := len(c); length > 0 {
+		return c[length-1]
 	}
-	switch true {
-	case strings.HasPrefix(mediaType, MIMEApplicationJSON), isLikeMediaType(mediaType, "json"):
-		err := json.Unmarshal(buf, body)
-		if err == nil {
-			return nil
-		}
-
-		if ute, ok := err.(*json.UnmarshalTypeError); ok {
-			if ute.Field == "" { // go1.11
-				return fmt.Errorf("unmarshal type error: expected=%v, got=%v, offset=%v",
-					ute.Type, ute.Value, ute.Offset)
-			}
-			return fmt.Errorf("unmarshal type error: field=%v, expected=%v, got=%v, offset=%v",
-				ute.Field, ute.Type, ute.Value, ute.Offset)
-		} else if se, ok := err.(*json.SyntaxError); ok {
-			return fmt.Errorf("syntax error: offset=%v, error=%v", se.Offset, se.Error())
-		} else {
-			return err
-		}
-	case strings.HasPrefix(mediaType, MIMEApplicationXML), isLikeMediaType(mediaType, "xml"):
-		return xml.Unmarshal(buf, body)
-	}
-
-	return ErrUnsupportedMediaType.WithMsgf("unsupported media type: %s", mediaType)
+	return nil
 }
 
-// HTTPError interface is used to create a server error that include status code and error message.
-type HTTPError interface {
-	// Error returns error's message.
-	Error() string
-	// Status returns error's http status code.
-	Status() int
+// RouteInfo represents a request route's specification which contains method and path and its handler.
+type RouteInfo struct {
+	Method      string
+	Path        string
+	Handler     string
+	HandlerFunc HandlerFunc
 }
 
-// Vira is the top-level framework struct.
-//
-// Hello Vira!
-//
-//	package main
-//
-//	func main() {
-//		vira := vira.New() // Create vira
-//		vira.Use(func(ctx *vira.Context) error {
-//			return ctx.HTML(200, "<h1>Hello, Vira!</h1>")
-//		})
-//		vira.Error(vira.Listen(":3000"))
-//	}
-type Vira struct {
-	Server *http.Server
-	mds    middlewares
+// RoutesInfo defines a RouteInfo slice.
+type RoutesInfo []RouteInfo
 
-	keys        []string
-	renderer    Renderer
-	sender      Sender
-	bodyParser  BodyParser
-	urlParser   URLParser
-	compress    Compressible  // Default to nil, do not compress response content.
-	timeout     time.Duration // Default to 0, no time out.
-	serverName  string        // Vira/1.7.6
-	logger      *log.Logger
-	parseError  func(error) HTTPError
-	renderError func(HTTPError) (code int, contentType string, body []byte)
-	onerror     func(*Context, HTTPError)
-	withContext func(*http.Request) context.Context
-	settings    map[any]any
-}
-
-// NewTrie creates an instance of App.
-func New() *Vira {
-	vira := new(Vira)
-	vira.Server = new(http.Server)
-	// https://medium.com/@simonfrey/go-as-in-golang-standard-net-http-config-will-break-your-production-environment-1360871cb72b
-	vira.Server.ReadHeaderTimeout = 20 * time.Second
-	vira.Server.ReadTimeout = 60 * time.Second
-	vira.Server.WriteTimeout = 120 * time.Second
-	vira.Server.IdleTimeout = 90 * time.Second
-
-	vira.mds = make(middlewares, 0)
-	vira.settings = make(map[any]any)
-
-	env := os.Getenv("APP_ENV")
-	if env == "" {
-		env = "development"
-	}
-	vira.Set(SetEnv, env)
-	vira.Set(SetServerName, "Vira/"+Version)
-	vira.Set(SetTrustedProxy, false)
-	vira.Set(SetBodyParser, DefaultBodyParser(2<<20)) // 2MB
-	vira.Set(SetURLParser, DefaultURLParser{})
-	vira.Set(SetLogger, log.New(os.Stderr, "", 0))
-	vira.Set(SetGraceTimeout, 10*time.Second)
-	vira.Set(SetParseError, func(err error) HTTPError {
-		return ParseError(err)
-	})
-	vira.Set(SetRenderError, defaultRenderError)
-	vira.Set(SetOnError, func(ctx *Context, err HTTPError) {
-		ctx.Error(err)
-	})
-	return vira
-}
-
-// Use uses the given middleware `handle`.
-func (vira *Vira) Use(handle Middleware) *Vira {
-	vira.mds = append(vira.mds, handle)
-	return vira
-}
-
-// UseHandler uses a instance that implemented Handler interface.
-func (vira *Vira) UseHandler(h Handler) *Vira {
-	vira.mds = append(vira.mds, h.Serve)
-	return vira
-}
-
-type appSetting uint8
-
-// Build-in vira settings
+// Trusted platforms
 const (
-	// It will be used by `ctx.ParseBody`, value should implements `vira.BodyParser` interface, default to:
-	//  vira.Set(vira.SetBodyParser, vira.DefaultBodyParser(1<<20))
-	SetBodyParser appSetting = iota
-
-	// It will be used by `ctx.ParseURL`, value should implements `vira.URLParser` interface, default to:
-	//  vira.Set(vira.SetURLParser, vira.DefaultURLParser)
-	SetURLParser
-
-	// Enable compress for response, value should implements `vira.Compressible` interface, no default value.
-	// Example:
-	//
-	//  vira := vira.New()
-	//  vira.Set(vira.SetCompress, compressible.WithThreshold(1024))
-	SetCompress
-
-	// Set secret keys for signed cookies, it will be used by `ctx.Cookies`, value should be `[]string` type,
-	// no default value. More document https://github.com/go-http-utils/cookie, Example:
-	//  vira.Set(vira.SetKeys, []string{"some key2", "some key1"})
-	SetKeys
-
-	// Set a logger to vira, value should be `*log.Logger` instance, default to:
-	//  vira.Set(vira.SetLogger, log.New(os.Stderr, "", 0))
-	// Maybe you need LoggerFilterWriter to filter some server errors in production:
-	//  vira.Set(vira.SetLogger, log.New(vira.DefaultFilterWriter(), "", 0))
-	// We recommand set logger flags to 0.
-	SetLogger
-
-	// Set a ParseError hook to vira that convert middleware error to HTTPError,
-	// value should be `func(err error) HTTPError`, default to:
-	//  vira.Set(SetParseError, func(err error) HTTPError {
-	//  	return ParseError(err)
-	//  })
-	SetParseError
-
-	// Set a SetRenderError hook to vira that convert error to raw response,
-	// value should be `func(HTTPError) (code int, contentType string, body []byte)`, default to:
-	//   vira.Set(SetRenderError, func(err HTTPError) (int, string, []byte) {
-	//  	// default to render error as json
-	//  	body, e := json.Marshal(err)
-	//  	if e != nil {
-	//  		body, _ = json.Marshal(map[string]string{"error": err.Error()})
-	//  	}
-	//  	return err.Status(), MIMEApplicationJSONCharsetUTF8, body
-	//  })
-	//
-	// you can use another recommand one:
-	//
-	//  vira.Set(vira.SetRenderError, vira.RenderErrorResponse)
-	//
-	SetRenderError
-
-	// Set a on-error hook to vira that handle middleware error.
-	// value should be `func(ctx *Context, err HTTPError)`, default to:
-	//  vira.Set(SetOnError, func(ctx *Context, err HTTPError) {
-	//  	ctx.Error(err)
-	//  })
-	SetOnError
-
-	// Set a SetSender to vira, it will be used by `ctx.Send`, value should implements `vira.Sender` interface,
-	// no default value.
-	SetSender
-
-	// Set a renderer to vira, it will be used by `ctx.Render`, value should implements `vira.Renderer` interface,
-	// no default value.
-	SetRenderer
-
-	// Set a timeout to for the middleware process, value should be `time.Duration`. No default.
-	// Example:
-	//  vira.Set(vira.SetTimeout, 3*time.Second)
-	SetTimeout
-
-	// Set a graceful timeout to for gracefully shuts down, value should be `time.Duration`. Default to 10*time.Second.
-	// Example:
-	//  vira.Set(vira.SetGraceTimeout, 60*time.Second)
-	SetGraceTimeout
-
-	// Set a function that Wrap the vira.Context' underlayer context.Context. No default.
-	SetWithContext
-
-	// Set a vira env string to vira, it can be retrieved by `ctx.Setting(vira.SetEnv)`.
-	// Default to os process "APP_ENV" or "development".
-	SetEnv
-
-	// Set a server name that respond to client as "Server" header.
-	// Default to "Vira/{version}".
-	SetServerName
-
-	// Set true and proxy header fields will be trusted
-	// Default to false.
-	SetTrustedProxy
+	// PlatformGoogleAppEngine when running on Google App Engine. Trust X-Appengine-Remote-Addr
+	// for determining the client's IP
+	PlatformGoogleAppEngine = "X-Appengine-Remote-Addr"
+	// PlatformCloudflare when using Cloudflare's CDN. Trust CF-Connecting-IP for determining
+	// the client's IP
+	PlatformCloudflare = "CF-Connecting-IP"
+	// PlatformFlyIO when running on Fly.io. Trust Fly-Client-IP for determining the client's IP
+	PlatformFlyIO = "Fly-Client-IP"
 )
 
-// Set add key/value settings to vira. The settings can be retrieved by `ctx.Setting(key)`.
-func (vira *Vira) Set(key, val any) *Vira {
-	if k, ok := key.(appSetting); ok {
-		switch key {
-		case SetBodyParser:
-			if bodyParser, ok := val.(BodyParser); !ok {
-				panic(ViraErr.WithMsg("SetBodyParser setting must implemented `vira.BodyParser` interface"))
-			} else {
-				vira.bodyParser = bodyParser
+// Engine is the framework's instance, it contains the muxer, middleware and configuration settings.
+// Create an instance of Engine, by using New() or Default()
+type Engine struct {
+	RouterGroup
+
+	// RedirectTrailingSlash enables automatic redirection if the current route can't be matched but a
+	// handler for the path with (without) the trailing slash exists.
+	// For example if /foo/ is requested but a route only exists for /foo, the
+	// client is redirected to /foo with http status code 301 for GET requests
+	// and 307 for all other request methods.
+	RedirectTrailingSlash bool
+
+	// RedirectFixedPath if enabled, the router tries to fix the current request path, if no
+	// handle is registered for it.
+	// First superfluous path elements like ../ or // are removed.
+	// Afterwards the router does a case-insensitive lookup of the cleaned path.
+	// If a handle can be found for this route, the router makes a redirection
+	// to the corrected path with status code 301 for GET requests and 307 for
+	// all other request methods.
+	// For example /FOO and /..//Foo could be redirected to /foo.
+	// RedirectTrailingSlash is independent of this option.
+	RedirectFixedPath bool
+
+	// HandleMethodNotAllowed if enabled, the router checks if another method is allowed for the
+	// current route, if the current request can not be routed.
+	// If this is the case, the request is answered with 'Method Not Allowed'
+	// and HTTP status code 405.
+	// If no other Method is allowed, the request is delegated to the NotFound
+	// handler.
+	HandleMethodNotAllowed bool
+
+	// ForwardedByClientIP if enabled, client IP will be parsed from the request's headers that
+	// match those stored at `(*vira.Engine).RemoteIPHeaders`. If no IP was
+	// fetched, it falls back to the IP obtained from
+	// `(*vira.Context).Request.RemoteAddr`.
+	ForwardedByClientIP bool
+
+	// AppEngine was deprecated.
+	// Deprecated: USE `TrustedPlatform` WITH VALUE `vira.PlatformGoogleAppEngine` INSTEAD
+	// #726 #755 If enabled, it will trust some headers starting with
+	// 'X-AppEngine...' for better integration with that PaaS.
+	AppEngine bool
+
+	// UseRawPath if enabled, the url.RawPath will be used to find parameters.
+	UseRawPath bool
+
+	// UnescapePathValues if true, the path value will be unescaped.
+	// If UseRawPath is false (by default), the UnescapePathValues effectively is true,
+	// as url.Path gonna be used, which is already unescaped.
+	UnescapePathValues bool
+
+	// RemoveExtraSlash a parameter can be parsed from the URL even with extra slashes.
+	// See the PR #1817 and issue #1644
+	RemoveExtraSlash bool
+
+	// RemoteIPHeaders list of headers used to obtain the client IP when
+	// `(*vira.Engine).ForwardedByClientIP` is `true` and
+	// `(*vira.Context).Request.RemoteAddr` is matched by at least one of the
+	// network origins of list defined by `(*vira.Engine).SetTrustedProxies()`.
+	RemoteIPHeaders []string
+
+	// TrustedPlatform if set to a constant of value vira.Platform*, trusts the headers set by
+	// that platform, for example to determine the client IP
+	TrustedPlatform string
+
+	// MaxMultipartMemory value of 'maxMemory' param that is given to http.Request's ParseMultipartForm
+	// method call.
+	MaxMultipartMemory int64
+
+	// UseH2C enable h2c support.
+	UseH2C bool
+
+	// ContextWithFallback enable fallback Context.Deadline(), Context.Done(), Context.Err() and Context.Value() when Context.Request.Context() is not nil.
+	ContextWithFallback bool
+
+	secureJSONPrefix string
+	FuncMap          template.FuncMap
+	allNoRoute       HandlersChain
+	allNoMethod      HandlersChain
+	noRoute          HandlersChain
+	noMethod         HandlersChain
+	pool             sync.Pool
+	trees            methodTrees
+	maxParams        uint16
+	maxSections      uint16
+	trustedProxies   []string
+	trustedCIDRs     []*net.IPNet
+}
+
+var _ IRouter = (*Engine)(nil)
+
+// New returns a new blank Engine instance without any middleware attached.
+// By default, the configuration is:
+// - RedirectTrailingSlash:  true
+// - RedirectFixedPath:      false
+// - HandleMethodNotAllowed: false
+// - ForwardedByClientIP:    true
+// - UseRawPath:             false
+// - UnescapePathValues:     true
+func New(opts ...OptionFunc) *Engine {
+	debugPrintWARNINGNew()
+	engine := &Engine{
+		RouterGroup: RouterGroup{
+			Handlers: nil,
+			basePath: "/",
+			root:     true,
+		},
+		FuncMap:                template.FuncMap{},
+		RedirectTrailingSlash:  true,
+		RedirectFixedPath:      false,
+		HandleMethodNotAllowed: false,
+		ForwardedByClientIP:    true,
+		RemoteIPHeaders:        []string{"X-Forwarded-For", "X-Real-IP"},
+		TrustedPlatform:        defaultPlatform,
+		UseRawPath:             false,
+		RemoveExtraSlash:       false,
+		UnescapePathValues:     true,
+		MaxMultipartMemory:     defaultMultipartMemory,
+		trees:                  make(methodTrees, 0, 9),
+		secureJSONPrefix:       "while(1);",
+		trustedProxies:         []string{"0.0.0.0/0", "::/0"},
+		trustedCIDRs:           defaultTrustedCIDRs,
+	}
+	engine.RouterGroup.engine = engine
+	engine.pool.New = func() any {
+		return engine.allocateContext(engine.maxParams)
+	}
+	return engine.With(opts...)
+}
+
+// Default returns an Engine instance with the Logger and Recovery middleware already attached.
+func Default(opts ...OptionFunc) *Engine {
+	debugPrintWARNINGDefault()
+	engine := New()
+	engine.Use(Logger(), Recovery())
+	return engine.With(opts...)
+}
+
+func (engine *Engine) Handler() http.Handler {
+	if !engine.UseH2C {
+		return engine
+	}
+
+	h2s := &http2.Server{}
+	return h2c.NewHandler(engine, h2s)
+}
+
+func (engine *Engine) allocateContext(maxParams uint16) *Context {
+	v := make(Params, 0, maxParams)
+	skippedNodes := make([]skippedNode, 0, engine.maxSections)
+	return &Context{engine: engine, params: &v, skippedNodes: &skippedNodes}
+}
+
+// SecureJsonPrefix sets the secureJSONPrefix used in Context.SecureJSON.
+func (engine *Engine) SecureJsonPrefix(prefix string) *Engine {
+	engine.secureJSONPrefix = prefix
+	return engine
+}
+
+// SetFuncMap sets the FuncMap used for template.FuncMap.
+func (engine *Engine) SetFuncMap(funcMap template.FuncMap) {
+	engine.FuncMap = funcMap
+}
+
+// NoRoute adds handlers for NoRoute. It returns a 404 code by default.
+func (engine *Engine) NoRoute(handlers ...HandlerFunc) {
+	engine.noRoute = handlers
+	engine.rebuild404Handlers()
+}
+
+// NoMethod sets the handlers called when Engine.HandleMethodNotAllowed = true.
+func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
+	engine.noMethod = handlers
+	engine.rebuild405Handlers()
+}
+
+// Use attaches a global middleware to the router. i.e. the middleware attached through Use() will be
+// included in the handlers chain for every single request. Even 404, 405, static files...
+// For example, this is the right place for a logger or error management middleware.
+func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
+	engine.RouterGroup.Use(middleware...)
+	engine.rebuild404Handlers()
+	engine.rebuild405Handlers()
+	return engine
+}
+
+// With returns a new Engine instance with the provided options.
+func (engine *Engine) With(opts ...OptionFunc) *Engine {
+	for _, opt := range opts {
+		opt(engine)
+	}
+
+	return engine
+}
+
+func (engine *Engine) rebuild404Handlers() {
+	engine.allNoRoute = engine.combineHandlers(engine.noRoute)
+}
+
+func (engine *Engine) rebuild405Handlers() {
+	engine.allNoMethod = engine.combineHandlers(engine.noMethod)
+}
+
+func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+	assert1(path[0] == '/', "path must begin with '/'")
+	assert1(method != "", "HTTP method can not be empty")
+	assert1(len(handlers) > 0, "there must be at least one handler")
+
+	debugPrintRoute(method, path, handlers)
+
+	root := engine.trees.get(method)
+	if root == nil {
+		root = new(node)
+		root.fullPath = "/"
+		engine.trees = append(engine.trees, methodTree{method: method, root: root})
+	}
+	root.addRoute(path, handlers)
+
+	if paramsCount := countParams(path); paramsCount > engine.maxParams {
+		engine.maxParams = paramsCount
+	}
+
+	if sectionsCount := countSections(path); sectionsCount > engine.maxSections {
+		engine.maxSections = sectionsCount
+	}
+}
+
+// Routes returns a slice of registered routes, including some useful information, such as:
+// the http method, path and the handler name.
+func (engine *Engine) Routes() (routes RoutesInfo) {
+	for _, tree := range engine.trees {
+		routes = iterate("", tree.method, routes, tree.root)
+	}
+	return routes
+}
+
+func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
+	path += root.path
+	if len(root.handlers) > 0 {
+		handlerFunc := root.handlers.Last()
+		routes = append(routes, RouteInfo{
+			Method:      method,
+			Path:        path,
+			Handler:     nameOfFunction(handlerFunc),
+			HandlerFunc: handlerFunc,
+		})
+	}
+	for _, child := range root.children {
+		routes = iterate(path, method, routes, child)
+	}
+	return routes
+}
+
+// Run attaches the router to a http.Server and starts listening and serving HTTP requests.
+// It is a shortcut for http.ListenAndServe(addr, router)
+// Note: this method will block the calling goroutine indefinitely unless an error happens.
+func (engine *Engine) Run(addr ...string) (err error) {
+	defer func() { debugPrintError(err) }()
+
+	if engine.isUnsafeTrustedProxies() {
+		debugPrint("[WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.\n" +
+			"Please check https://pkg.go.dev/github.com/vira-software/vira#readme-don-t-trust-all-proxies for details.")
+	}
+
+	address := resolveAddress(addr)
+	debugPrint("Listening and serving HTTP on %s\n", address)
+	err = http.ListenAndServe(address, engine.Handler())
+	return
+}
+
+func (engine *Engine) prepareTrustedCIDRs() ([]*net.IPNet, error) {
+	if engine.trustedProxies == nil {
+		return nil, nil
+	}
+
+	cidr := make([]*net.IPNet, 0, len(engine.trustedProxies))
+	for _, trustedProxy := range engine.trustedProxies {
+		if !strings.Contains(trustedProxy, "/") {
+			ip := parseIP(trustedProxy)
+			if ip == nil {
+				return cidr, &net.ParseError{Type: "IP address", Text: trustedProxy}
 			}
-		case SetURLParser:
-			if urlParser, ok := val.(URLParser); !ok {
-				panic(ViraErr.WithMsg("SetURLParser setting must implemented `vira.URLParser` interface"))
-			} else {
-				vira.urlParser = urlParser
-			}
-		case SetCompress:
-			if compress, ok := val.(Compressible); !ok {
-				panic(ViraErr.WithMsg("SetCompress setting must implemented `vira.Compressible` interface"))
-			} else {
-				vira.compress = compress
-			}
-		case SetKeys:
-			if keys, ok := val.([]string); !ok {
-				panic(ViraErr.WithMsg("SetKeys setting must be `[]string`"))
-			} else {
-				vira.keys = keys
-			}
-		case SetLogger:
-			if logger, ok := val.(*log.Logger); !ok {
-				panic(ViraErr.WithMsg("SetLogger setting must be `*log.Logger` instance"))
-			} else {
-				vira.logger = logger
-			}
-		case SetParseError:
-			if parseError, ok := val.(func(error) HTTPError); !ok {
-				panic(ViraErr.WithMsg("SetParseError setting must be `func(error) HTTPError`"))
-			} else {
-				vira.parseError = parseError
-			}
-		case SetRenderError:
-			if renderError, ok := val.(func(HTTPError) (int, string, []byte)); !ok {
-				panic(ViraErr.WithMsg("SetRenderError setting must be `func(HTTPError) (int, string, []byte)`"))
-			} else {
-				vira.renderError = renderError
-			}
-		case SetOnError:
-			if onerror, ok := val.(func(*Context, HTTPError)); !ok {
-				panic(ViraErr.WithMsg("SetOnError setting must be `func(*Context, HTTPError)`"))
-			} else {
-				vira.onerror = onerror
-			}
-		case SetSender:
-			if sender, ok := val.(Sender); !ok {
-				panic(ViraErr.WithMsg("SetSender setting must implemented `vira.Sender` interface"))
-			} else {
-				vira.sender = sender
-			}
-		case SetRenderer:
-			if renderer, ok := val.(Renderer); !ok {
-				panic(ViraErr.WithMsg("SetRenderer setting must implemented `vira.Renderer` interface"))
-			} else {
-				vira.renderer = renderer
-			}
-		case SetTimeout:
-			if timeout, ok := val.(time.Duration); !ok {
-				panic(ViraErr.WithMsg("SetTimeout setting must be `time.Duration` instance"))
-			} else {
-				vira.timeout = timeout
-			}
-		case SetGraceTimeout:
-			if _, ok := val.(time.Duration); !ok {
-				panic(ViraErr.WithMsg("SetGraceTimeout setting must be `time.Duration` instance"))
-			}
-		case SetWithContext:
-			if withContext, ok := val.(func(*http.Request) context.Context); !ok {
-				panic(ViraErr.WithMsg("SetWithContext setting must be `func(*http.Request) context.Context`"))
-			} else {
-				vira.withContext = withContext
-			}
-		case SetEnv:
-			if _, ok := val.(string); !ok {
-				panic(ViraErr.WithMsg("SetEnv setting must be `string`"))
-			}
-		case SetServerName:
-			if name, ok := val.(string); !ok {
-				panic(ViraErr.WithMsg("SetServerName setting must be `string`"))
-			} else {
-				vira.serverName = name
-			}
-		case SetTrustedProxy:
-			if _, ok := val.(bool); !ok {
-				panic(ViraErr.WithMsg("SetTrustedProxy setting must be `bool`"))
+
+			switch len(ip) {
+			case net.IPv4len:
+				trustedProxy += "/32"
+			case net.IPv6len:
+				trustedProxy += "/128"
 			}
 		}
-		vira.settings[k] = val
-		return vira
-	}
-	vira.settings[key] = val
-	return vira
-}
-
-// Env returns vira's env. You can set vira env with `vira.Set(vira.SetEnv, "some env")`
-// Default to os process "APP_ENV" or "development".
-func (vira *Vira) Env() string {
-	return vira.settings[SetEnv].(string)
-}
-
-// Listen starts the HTTP server.
-func (vira *Vira) Listen(addr string) error {
-	vira.Server.Addr = addr
-	vira.Server.ErrorLog = vira.logger
-	vira.Server.Handler = vira
-	// vira.Server.Handler = h2c.NewHandler(vira, &http2.Server{})
-	// Print the server info
-	FprintWithColor(std.Out, fmt.Sprintf("%s http server started on %s \n", banner, addr), ColorCyan)
-	return vira.Server.ListenAndServe()
-}
-
-// ListenTLS starts the HTTPS server.
-func (vira *Vira) ListenTLS(addr, certFile, keyFile string) error {
-	vira.Server.Addr = addr
-	vira.Server.ErrorLog = vira.logger
-	vira.Server.Handler = vira
-	return vira.Server.ListenAndServeTLS(certFile, keyFile)
-}
-
-// ListenWithContext starts the HTTP server (or HTTPS server with keyPair) with a context
-//
-// Usage:
-//
-//	 func main() {
-//	 	vira := vira.New() // Create vira
-//	 	do some thing...
-//
-//	 	vira.ListenWithContext(vira.ContextWithSignal(context.Background()), addr)
-//		  // starts the HTTPS server.
-//		  // vira.ListenWithContext(vira.ContextWithSignal(context.Background()), addr, certFile, keyFile)
-//	 }
-func (vira *Vira) ListenWithContext(ctx context.Context, addr string, keyPair ...string) error {
-	timeout := vira.settings[SetGraceTimeout].(time.Duration)
-	go func() {
-		<-ctx.Done()
-		c, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		if err := vira.Close(c); err != nil {
-			vira.Error(err)
+		_, cidrNet, err := net.ParseCIDR(trustedProxy)
+		if err != nil {
+			return cidr, err
 		}
-	}()
-
-	if len(keyPair) >= 2 && keyPair[0] != "" && keyPair[1] != "" {
-		return vira.ListenTLS(addr, keyPair[0], keyPair[1])
+		cidr = append(cidr, cidrNet)
 	}
-	return vira.Listen(addr)
+	return cidr, nil
 }
 
-// ServeWithContext accepts incoming connections on the Listener l, starts the HTTP server (or HTTPS server with keyPair) with a context
-//
-// Usage:
-//
-//	 func main() {
-//			l, err := net.Listen("tcp", ":8080")
-//			if err != nil {
-//				log.Fatal(err)
-//			}
-//
-//	 	vira := vira.New() // Create vira
-//	 	do some thing...
-//
-//	 	vira.ServeWithContext(vira.ContextWithSignal(context.Background()), l)
-//		  // starts the HTTPS server.
-//		  // vira.ServeWithContext(vira.ContextWithSignal(context.Background()), l, certFile, keyFile)
-//	 }
-func (vira *Vira) ServeWithContext(ctx context.Context, l net.Listener, keyPair ...string) error {
-	timeout := vira.settings[SetGraceTimeout].(time.Duration)
-	go func() {
-		<-ctx.Done()
-		c, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		if err := vira.Close(c); err != nil {
-			vira.Error(err)
+// SetTrustedProxies set a list of network origins (IPv4 addresses,
+// IPv4 CIDRs, IPv6 addresses or IPv6 CIDRs) from which to trust
+// request's headers that contain alternative client IP when
+// `(*vira.Engine).ForwardedByClientIP` is `true`. `TrustedProxies`
+// feature is enabled by default, and it also trusts all proxies
+// by default. If you want to disable this feature, use
+// Engine.SetTrustedProxies(nil), then Context.ClientIP() will
+// return the remote address directly.
+func (engine *Engine) SetTrustedProxies(trustedProxies []string) error {
+	engine.trustedProxies = trustedProxies
+	return engine.parseTrustedProxies()
+}
+
+// isUnsafeTrustedProxies checks if Engine.trustedCIDRs contains all IPs, it's not safe if it has (returns true)
+func (engine *Engine) isUnsafeTrustedProxies() bool {
+	return engine.isTrustedProxy(net.ParseIP("0.0.0.0")) || engine.isTrustedProxy(net.ParseIP("::"))
+}
+
+// parseTrustedProxies parse Engine.trustedProxies to Engine.trustedCIDRs
+func (engine *Engine) parseTrustedProxies() error {
+	trustedCIDRs, err := engine.prepareTrustedCIDRs()
+	engine.trustedCIDRs = trustedCIDRs
+	return err
+}
+
+// isTrustedProxy will check whether the IP address is included in the trusted list according to Engine.trustedCIDRs
+func (engine *Engine) isTrustedProxy(ip net.IP) bool {
+	if engine.trustedCIDRs == nil {
+		return false
+	}
+	for _, cidr := range engine.trustedCIDRs {
+		if cidr.Contains(ip) {
+			return true
 		}
-	}()
-
-	vira.Server.ErrorLog = vira.logger
-	vira.Server.Handler = vira
-	if len(keyPair) >= 2 && keyPair[0] != "" && keyPair[1] != "" {
-		return vira.Server.ServeTLS(l, keyPair[0], keyPair[1])
 	}
-	return vira.Server.Serve(l)
+	return false
 }
 
-// Start starts a non-blocking vira instance. It is useful for testing.
-// If addr omit, the vira will listen on a random addr, use ServerListener.Addr() to get it.
-// The non-blocking vira instance must close by ServerListener.Close().
-func (vira *Vira) Start(addr ...string) *ServerListener {
-	laddr := "127.0.0.1:0"
-	if len(addr) > 0 && addr[0] != "" {
-		laddr = addr[0]
+// validateHeader will parse X-Forwarded-For header and return the trusted client IP address
+func (engine *Engine) validateHeader(header string) (clientIP string, valid bool) {
+	if header == "" {
+		return "", false
 	}
-	vira.Server.ErrorLog = vira.logger
-	vira.Server.Handler = vira
+	items := strings.Split(header, ",")
+	for i := len(items) - 1; i >= 0; i-- {
+		ipStr := strings.TrimSpace(items[i])
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			break
+		}
 
-	l, err := net.Listen("tcp", laddr)
+		// X-Forwarded-For is appended by proxy
+		// Check IPs in reverse order and stop when find untrusted proxy
+		if (i == 0) || (!engine.isTrustedProxy(ip)) {
+			return ipStr, true
+		}
+	}
+	return "", false
+}
+
+// parseIP parse a string representation of an IP and returns a net.IP with the
+// minimum byte representation or nil if input is invalid.
+func parseIP(ip string) net.IP {
+	parsedIP := net.ParseIP(ip)
+
+	if ipv4 := parsedIP.To4(); ipv4 != nil {
+		// return ip in a 4-byte representation
+		return ipv4
+	}
+
+	// return ip in a 16-byte representation or nil
+	return parsedIP
+}
+
+// RunTLS attaches the router to a http.Server and starts listening and serving HTTPS (secure) requests.
+// It is a shortcut for http.ListenAndServeTLS(addr, certFile, keyFile, router)
+// Note: this method will block the calling goroutine indefinitely unless an error happens.
+func (engine *Engine) RunTLS(addr, certFile, keyFile string) (err error) {
+	debugPrint("Listening and serving HTTPS on %s\n", addr)
+	defer func() { debugPrintError(err) }()
+
+	if engine.isUnsafeTrustedProxies() {
+		debugPrint("[WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.\n" +
+			"Please check https://pkg.go.dev/github.com/vira-software/vira#readme-don-t-trust-all-proxies for details.")
+	}
+
+	err = http.ListenAndServeTLS(addr, certFile, keyFile, engine.Handler())
+	return
+}
+
+// RunUnix attaches the router to a http.Server and starts listening and serving HTTP requests
+// through the specified unix socket (i.e. a file).
+// Note: this method will block the calling goroutine indefinitely unless an error happens.
+func (engine *Engine) RunUnix(file string) (err error) {
+	debugPrint("Listening and serving HTTP on unix:/%s", file)
+	defer func() { debugPrintError(err) }()
+
+	if engine.isUnsafeTrustedProxies() {
+		debugPrint("[WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.\n" +
+			"Please check https://github.com/vira-software/vira/blob/master/docs/doc.md#dont-trust-all-proxies for details.")
+	}
+
+	listener, err := net.Listen("unix", file)
 	if err != nil {
-		panic(ViraErr.WithMsgf("failed to listen on %v: %v", laddr, err))
+		return
 	}
+	defer listener.Close()
+	defer os.Remove(file)
 
-	c := make(chan error)
-	go func() {
-		c <- vira.Server.Serve(l)
-	}()
-	return &ServerListener{l, c}
+	err = http.Serve(listener, engine.Handler())
+	return
 }
 
-// Error writes error to underlayer logging system.
-func (vira *Vira) Error(err any) {
-	if err := ErrorWithStack(err, 2); err != nil {
-		str, e := err.Format()
-		f := vira.logger.Flags() == 0
-		switch {
-		case f && e == nil:
-			vira.logger.Printf("[%s] ERR %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.999Z"), str)
-		case f && e != nil:
-			vira.logger.Printf("[%s] CRIT %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.999Z"), err.String())
-		case !f && e == nil:
-			vira.logger.Printf("ERR %s\n", str)
-		default:
-			vira.logger.Printf("CRIT %s\n", err.String())
+// RunFd attaches the router to a http.Server and starts listening and serving HTTP requests
+// through the specified file descriptor.
+// Note: this method will block the calling goroutine indefinitely unless an error happens.
+func (engine *Engine) RunFd(fd int) (err error) {
+	debugPrint("Listening and serving HTTP on fd@%d", fd)
+	defer func() { debugPrintError(err) }()
+
+	if engine.isUnsafeTrustedProxies() {
+		debugPrint("[WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.\n" +
+			"Please check https://github.com/vira-software/vira/blob/master/docs/doc.md#dont-trust-all-proxies for details.")
+	}
+
+	f := os.NewFile(uintptr(fd), fmt.Sprintf("fd@%d", fd))
+	listener, err := net.FileListener(f)
+	if err != nil {
+		return
+	}
+	defer listener.Close()
+	err = engine.RunListener(listener)
+	return
+}
+
+// RunListener attaches the router to a http.Server and starts listening and serving HTTP requests
+// through the specified net.Listener
+func (engine *Engine) RunListener(listener net.Listener) (err error) {
+	debugPrint("Listening and serving HTTP on listener what's bind with address@%s", listener.Addr())
+	defer func() { debugPrintError(err) }()
+
+	if engine.isUnsafeTrustedProxies() {
+		debugPrint("[WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.\n" +
+			"Please check https://github.com/vira-software/vira/blob/master/docs/doc.md#dont-trust-all-proxies for details.")
+	}
+
+	err = http.Serve(listener, engine.Handler())
+	return
+}
+
+// ServeHTTP conforms to the http.Handler interface.
+func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	c := engine.pool.Get().(*Context)
+	c.writermem.reset(w)
+	c.Request = req
+	c.reset()
+
+	engine.handleHTTPRequest(c)
+
+	engine.pool.Put(c)
+}
+
+// HandleContext re-enters a context that has been rewritten.
+// This can be done by setting c.Request.URL.Path to your new target.
+// Disclaimer: You can loop yourself to deal with this, use wisely.
+func (engine *Engine) HandleContext(c *Context) {
+	oldIndexValue := c.index
+	c.reset()
+	engine.handleHTTPRequest(c)
+
+	c.index = oldIndexValue
+}
+
+func (engine *Engine) handleHTTPRequest(c *Context) {
+	httpMethod := c.Request.Method
+	rPath := c.Request.URL.Path
+	unescape := false
+	if engine.UseRawPath && len(c.Request.URL.RawPath) > 0 {
+		rPath = c.Request.URL.RawPath
+		unescape = engine.UnescapePathValues
+	}
+
+	if engine.RemoveExtraSlash {
+		rPath = cleanPath(rPath)
+	}
+
+	// Find root of the tree for the given HTTP method
+	t := engine.trees
+	for i, tl := 0, len(t); i < tl; i++ {
+		if t[i].method != httpMethod {
+			continue
+		}
+		root := t[i].root
+		// Find route in tree
+		value := root.getValue(rPath, c.params, c.skippedNodes, unescape)
+		if value.params != nil {
+			c.Params = *value.params
+		}
+		if value.handlers != nil {
+			c.handlers = value.handlers
+			c.fullPath = value.fullPath
+			c.Next()
+			c.writermem.WriteHeaderNow()
+			return
+		}
+		if httpMethod != http.MethodConnect && rPath != "/" {
+			if value.tsr && engine.RedirectTrailingSlash {
+				redirectTrailingSlash(c)
+				return
+			}
+			if engine.RedirectFixedPath && redirectFixedPath(c, root, engine.RedirectFixedPath) {
+				return
+			}
+		}
+		break
+	}
+
+	if engine.HandleMethodNotAllowed {
+		// According to RFC 7231 section 6.5.5, MUST generate an Allow header field in response
+		// containing a list of the target resource's currently supported methods.
+		allowed := make([]string, 0, len(t)-1)
+		for _, tree := range engine.trees {
+			if tree.method == httpMethod {
+				continue
+			}
+			if value := tree.root.getValue(rPath, nil, c.skippedNodes, unescape); value.handlers != nil {
+				allowed = append(allowed, tree.method)
+			}
+		}
+		if len(allowed) > 0 {
+			c.handlers = engine.allNoMethod
+			c.writermem.Header().Set("Allow", strings.Join(allowed, ", "))
+			serveError(c, http.StatusMethodNotAllowed, default405Body)
+			return
 		}
 	}
+
+	c.handlers = engine.allNoRoute
+	serveError(c, http.StatusNotFound, default404Body)
 }
 
-func (vira *Vira) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := NewContext(vira, w, r)
+var mimePlain = []string{MIMEPlain}
 
-	// TODO: handle compression writer
-	// if compressWriter := ctx.handleCompress(); compressWriter != nil {
-	// 	defer compressWriter.Close()
-	// }
-
-	// recover panic error
-	defer catchRequest(ctx)
-	go handleCtxEnd(ctx)
-
-	// process vira middleware
-	err := vira.mds.run(ctx)
-	if ctx.Res.wroteHeader.isTrue() {
-		if !IsNil(err) {
-			vira.Error(err)
+func serveError(c *Context, code int, defaultMessage []byte) {
+	c.writermem.status = code
+	c.Next()
+	if c.writermem.Written() {
+		return
+	}
+	if c.writermem.Status() == code {
+		c.writermem.Header()["Content-Type"] = mimePlain
+		_, err := c.Writer.Write(defaultMessage)
+		if err != nil {
+			debugPrint("cannot write message to writer during serve error: %v", err)
 		}
 		return
 	}
+	c.writermem.WriteHeaderNow()
+}
 
-	// if context canceled abnormally...
-	if e := ctx.Err(); e != nil {
-		if e == context.Canceled {
-			// https://stackoverflow.com/questions/46234679/what-is-the-correct-http-status-code-for-a-cancelled-request
-			// 499 Client Closed Request Used when the client has closed
-			// the request before the server could send a response.
-			ctx.Res.WriteHeader(ErrClientClosedRequest.Code)
-			return
-		}
-		err = ErrGatewayTimeout.WithMsg(e.Error())
+func redirectTrailingSlash(c *Context) {
+	req := c.Request
+	p := req.URL.Path
+	if prefix := path.Clean(c.Request.Header.Get("X-Forwarded-Prefix")); prefix != "." {
+		prefix = regSafePrefix.ReplaceAllString(prefix, "")
+		prefix = regRemoveRepeatedChar.ReplaceAllString(prefix, "/")
+
+		p = prefix + "/" + req.URL.Path
 	}
-
-	// handle middleware errors
-	if !IsNil(err) {
-		ctx.Res.afterHooks = nil // clear afterHooks when any error
-		ctx.Res.ResetHeader()
-		e := vira.parseError(err)
-		vira.onerror(ctx, e)
-		// try to ensure respond error if `vira.onerror` does't do it.
-		ctx.respondError(e)
-	} else {
-		// try to ensure respond
-		ctx.Res.respond(0, nil)
+	req.URL.Path = p + "/"
+	if length := len(p); length > 1 && p[length-1] == '/' {
+		req.URL.Path = p[:length-1]
 	}
+	redirectRequest(c)
 }
 
-// Close closes the underlying server gracefully.
-// If context omit, Server.Close will be used to close immediately.
-// Otherwise Server.Shutdown will be used to close gracefully.
-func (vira *Vira) Close(ctx ...context.Context) error {
-	if len(ctx) > 0 {
-		return vira.Server.Shutdown(ctx[0])
+func redirectFixedPath(c *Context, root *node, trailingSlash bool) bool {
+	req := c.Request
+	rPath := req.URL.Path
+
+	if fixedPath, ok := root.findCaseInsensitivePath(cleanPath(rPath), trailingSlash); ok {
+		req.URL.Path = bytesconv.BytesToString(fixedPath)
+		redirectRequest(c)
+		return true
 	}
-	return vira.Server.Close()
+	return false
 }
 
-// ServerListener is returned by a non-blocking vira instance.
-type ServerListener struct {
-	l net.Listener
-	c <-chan error
-}
+func redirectRequest(c *Context) {
+	req := c.Request
+	rPath := req.URL.Path
+	rURL := req.URL.String()
 
-// Close closes the non-blocking vira instance.
-func (s *ServerListener) Close() error {
-	return s.l.Close()
-}
-
-// Addr returns the non-blocking vira instance addr.
-func (s *ServerListener) Addr() net.Addr {
-	return s.l.Addr()
-}
-
-// Wait make the non-blocking vira instance blocking.
-func (s *ServerListener) Wait() error {
-	return <-s.c
-}
-
-func catchRequest(ctx *Context) {
-	if err := recover(); err != nil && err != http.ErrAbortHandler {
-		ctx.Res.afterHooks = nil
-		ctx.Res.ResetHeader()
-		e := ErrorWithStack(err, 3)
-		ctx.vira.onerror(ctx, e)
-		// try to ensure respond error if `vira.onerror` does't do it.
-		ctx.respondError(e)
+	code := http.StatusMovedPermanently // Permanent redirect, request with GET method
+	if req.Method != http.MethodGet {
+		code = http.StatusTemporaryRedirect
 	}
-	// execute "end hooks" with LIFO order after Response.WriteHeader.
-	// they run in a goroutine, in order to not block current HTTP Request/Response.
-	if len(ctx.Res.endHooks) > 0 {
-		go tryRunHooks(ctx.vira, ctx.Res.endHooks)
-	}
-}
-
-func handleCtxEnd(ctx *Context) {
-	<-ctx.done
-	ctx.Res.ended.setTrue()
-}
-
-func runHooks(hooks []func()) {
-	// run hooks in LIFO order
-	for i := len(hooks) - 1; i >= 0; i-- {
-		hooks[i]()
-	}
-}
-
-func tryRunHooks(vira *Vira, hooks []func()) {
-	defer catchErr(vira)
-	runHooks(hooks)
-}
-
-func catchErr(vira *Vira) {
-	if err := recover(); err != nil && err != http.ErrAbortHandler {
-		vira.Error(err)
-	}
+	debugPrint("redirecting request %d: %s --> %s", code, rPath, rURL)
+	http.Redirect(c.Writer, req, rURL, code)
+	c.writermem.WriteHeaderNow()
 }
