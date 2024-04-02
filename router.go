@@ -51,7 +51,7 @@ type IRoutes interface {
 type RouterGroup struct {
 	Handlers HandlersChain
 	basePath string
-	engine   *Engine
+	engine   *Vira
 	root     bool
 }
 

@@ -57,7 +57,7 @@ type Context struct {
 	index    int8
 	fullPath string
 
-	engine       *Engine
+	engine       *Vira
 	params       *Params
 	skippedNodes *[]skippedNode
 
@@ -637,7 +637,7 @@ func (c *Context) BindBodyWithYAML(obj any) error {
 
 // ClientIP implements one best effort algorithm to return the real client IP.
 // It calls c.RemoteIP() under the hood, to check if the remote IP is a trusted proxy or not.
-// If it is it will then try to parse the headers defined in Engine.RemoteIPHeaders (defaulting to [X-Forwarded-For, X-Real-Ip]).
+// If it is it will then try to parse the headers defined in Vira.RemoteIPHeaders (defaulting to [X-Forwarded-For, X-Real-Ip]).
 // If the headers are not syntactically valid OR the remote IP does not correspond to a trusted proxy,
 // the remote IP (coming from Request.RemoteAddr) is returned.
 func (c *Context) ClientIP() string {
@@ -649,9 +649,9 @@ func (c *Context) ClientIP() string {
 		}
 	}
 
-	// Legacy "AppEngine" flag
-	if c.engine.AppEngine {
-		log.Println(`The AppEngine flag is going to be deprecated. Please check issues #2723 and #2739 and use 'TrustedPlatform: vira.PlatformGoogleAppEngine' instead.`)
+	// Legacy "AppVira" flag
+	if c.engine.AppVira {
+		log.Println(`The AppVira flag is going to be deprecated. Please check issues #2723 and #2739 and use 'TrustedPlatform: vira.PlatformGoogleAppVira' instead.`)
 		if addr := c.requestHeader("X-Appengine-Remote-Addr"); addr != "" {
 			return addr
 		}
@@ -659,7 +659,7 @@ func (c *Context) ClientIP() string {
 
 	// It also checks if the remoteIP is a trusted proxy or not.
 	// In order to perform this validation, it will see if the IP is contained within at least one of the CIDR blocks
-	// defined by Engine.SetTrustedProxies()
+	// defined by Vira.SetTrustedProxies()
 	remoteIP := net.ParseIP(c.RemoteIP())
 	if remoteIP == nil {
 		return ""

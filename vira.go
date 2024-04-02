@@ -43,7 +43,7 @@ var regRemoveRepeatedChar = regexp.MustCompile("/{2,}")
 type HandlerFunc func(*Context)
 
 // OptionFunc defines the function to change the default configuration
-type OptionFunc func(*Engine)
+type OptionFunc func(*Vira)
 
 // HandlersChain defines a HandlerFunc slice.
 type HandlersChain []HandlerFunc
@@ -69,9 +69,9 @@ type RoutesInfo []RouteInfo
 
 // Trusted platforms
 const (
-	// PlatformGoogleAppEngine when running on Google App Engine. Trust X-Appengine-Remote-Addr
+	// PlatformGoogleAppVira when running on Google App Vira. Trust X-Appengine-Remote-Addr
 	// for determining the client's IP
-	PlatformGoogleAppEngine = "X-Appengine-Remote-Addr"
+	PlatformGoogleAppVira = "X-Appengine-Remote-Addr"
 	// PlatformCloudflare when using Cloudflare's CDN. Trust CF-Connecting-IP for determining
 	// the client's IP
 	PlatformCloudflare = "CF-Connecting-IP"
@@ -79,9 +79,9 @@ const (
 	PlatformFlyIO = "Fly-Client-IP"
 )
 
-// Engine is the framework's instance, it contains the muxer, middleware and configuration settings.
-// Create an instance of Engine, by using New() or Default()
-type Engine struct {
+// Vira is the framework's instance, it contains the muxer, middleware and configuration settings.
+// Create an instance of Vira, by using New() or Default()
+type Vira struct {
 	RouterGroup
 
 	// RedirectTrailingSlash enables automatic redirection if the current route can't be matched but a
@@ -111,16 +111,16 @@ type Engine struct {
 	HandleMethodNotAllowed bool
 
 	// ForwardedByClientIP if enabled, client IP will be parsed from the request's headers that
-	// match those stored at `(*vira.Engine).RemoteIPHeaders`. If no IP was
+	// match those stored at `(*vira.Vira).RemoteIPHeaders`. If no IP was
 	// fetched, it falls back to the IP obtained from
 	// `(*vira.Context).Request.RemoteAddr`.
 	ForwardedByClientIP bool
 
-	// AppEngine was deprecated.
-	// Deprecated: USE `TrustedPlatform` WITH VALUE `vira.PlatformGoogleAppEngine` INSTEAD
+	// AppVira was deprecated.
+	// Deprecated: USE `TrustedPlatform` WITH VALUE `vira.PlatformGoogleAppVira` INSTEAD
 	// #726 #755 If enabled, it will trust some headers starting with
-	// 'X-AppEngine...' for better integration with that PaaS.
-	AppEngine bool
+	// 'X-AppVira...' for better integration with that PaaS.
+	AppVira bool
 
 	// UseRawPath if enabled, the url.RawPath will be used to find parameters.
 	UseRawPath bool
@@ -135,9 +135,9 @@ type Engine struct {
 	RemoveExtraSlash bool
 
 	// RemoteIPHeaders list of headers used to obtain the client IP when
-	// `(*vira.Engine).ForwardedByClientIP` is `true` and
+	// `(*vira.Vira).ForwardedByClientIP` is `true` and
 	// `(*vira.Context).Request.RemoteAddr` is matched by at least one of the
-	// network origins of list defined by `(*vira.Engine).SetTrustedProxies()`.
+	// network origins of list defined by `(*vira.Vira).SetTrustedProxies()`.
 	RemoteIPHeaders []string
 
 	// TrustedPlatform if set to a constant of value vira.Platform*, trusts the headers set by
@@ -168,9 +168,9 @@ type Engine struct {
 	trustedCIDRs     []*net.IPNet
 }
 
-var _ IRouter = (*Engine)(nil)
+var _ IRouter = (*Vira)(nil)
 
-// New returns a new blank Engine instance without any middleware attached.
+// New returns a new blank Vira instance without any middleware attached.
 // By default, the configuration is:
 // - RedirectTrailingSlash:  true
 // - RedirectFixedPath:      false
@@ -178,9 +178,9 @@ var _ IRouter = (*Engine)(nil)
 // - ForwardedByClientIP:    true
 // - UseRawPath:             false
 // - UnescapePathValues:     true
-func New(opts ...OptionFunc) *Engine {
+func New(opts ...OptionFunc) *Vira {
 	debugPrintWARNINGNew()
-	engine := &Engine{
+	engine := &Vira{
 		RouterGroup: RouterGroup{
 			Handlers: nil,
 			basePath: "/",
@@ -209,15 +209,15 @@ func New(opts ...OptionFunc) *Engine {
 	return engine.With(opts...)
 }
 
-// Default returns an Engine instance with the Logger and Recovery middleware already attached.
-func Default(opts ...OptionFunc) *Engine {
+// Default returns an Vira instance with the Logger and Recovery middleware already attached.
+func Default(opts ...OptionFunc) *Vira {
 	debugPrintWARNINGDefault()
 	engine := New()
 	engine.Use(Logger(), Recovery())
 	return engine.With(opts...)
 }
 
-func (engine *Engine) Handler() http.Handler {
+func (engine *Vira) Handler() http.Handler {
 	if !engine.UseH2C {
 		return engine
 	}
@@ -226,31 +226,31 @@ func (engine *Engine) Handler() http.Handler {
 	return h2c.NewHandler(engine, h2s)
 }
 
-func (engine *Engine) allocateContext(maxParams uint16) *Context {
+func (engine *Vira) allocateContext(maxParams uint16) *Context {
 	v := make(Params, 0, maxParams)
 	skippedNodes := make([]skippedNode, 0, engine.maxSections)
 	return &Context{engine: engine, params: &v, skippedNodes: &skippedNodes}
 }
 
 // SecureJsonPrefix sets the secureJSONPrefix used in Context.SecureJSON.
-func (engine *Engine) SecureJsonPrefix(prefix string) *Engine {
+func (engine *Vira) SecureJsonPrefix(prefix string) *Vira {
 	engine.secureJSONPrefix = prefix
 	return engine
 }
 
 // SetFuncMap sets the FuncMap used for template.FuncMap.
-func (engine *Engine) SetFuncMap(funcMap template.FuncMap) {
+func (engine *Vira) SetFuncMap(funcMap template.FuncMap) {
 	engine.FuncMap = funcMap
 }
 
 // NoRoute adds handlers for NoRoute. It returns a 404 code by default.
-func (engine *Engine) NoRoute(handlers ...HandlerFunc) {
+func (engine *Vira) NoRoute(handlers ...HandlerFunc) {
 	engine.noRoute = handlers
 	engine.rebuild404Handlers()
 }
 
-// NoMethod sets the handlers called when Engine.HandleMethodNotAllowed = true.
-func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
+// NoMethod sets the handlers called when Vira.HandleMethodNotAllowed = true.
+func (engine *Vira) NoMethod(handlers ...HandlerFunc) {
 	engine.noMethod = handlers
 	engine.rebuild405Handlers()
 }
@@ -258,15 +258,15 @@ func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
 // Use attaches a global middleware to the router. i.e. the middleware attached through Use() will be
 // included in the handlers chain for every single request. Even 404, 405, static files...
 // For example, this is the right place for a logger or error management middleware.
-func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
+func (engine *Vira) Use(middleware ...HandlerFunc) IRoutes {
 	engine.RouterGroup.Use(middleware...)
 	engine.rebuild404Handlers()
 	engine.rebuild405Handlers()
 	return engine
 }
 
-// With returns a new Engine instance with the provided options.
-func (engine *Engine) With(opts ...OptionFunc) *Engine {
+// With returns a new Vira instance with the provided options.
+func (engine *Vira) With(opts ...OptionFunc) *Vira {
 	for _, opt := range opts {
 		opt(engine)
 	}
@@ -274,15 +274,15 @@ func (engine *Engine) With(opts ...OptionFunc) *Engine {
 	return engine
 }
 
-func (engine *Engine) rebuild404Handlers() {
+func (engine *Vira) rebuild404Handlers() {
 	engine.allNoRoute = engine.combineHandlers(engine.noRoute)
 }
 
-func (engine *Engine) rebuild405Handlers() {
+func (engine *Vira) rebuild405Handlers() {
 	engine.allNoMethod = engine.combineHandlers(engine.noMethod)
 }
 
-func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+func (engine *Vira) addRoute(method, path string, handlers HandlersChain) {
 	assert1(path[0] == '/', "path must begin with '/'")
 	assert1(method != "", "HTTP method can not be empty")
 	assert1(len(handlers) > 0, "there must be at least one handler")
@@ -308,7 +308,7 @@ func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
 
 // Routes returns a slice of registered routes, including some useful information, such as:
 // the http method, path and the handler name.
-func (engine *Engine) Routes() (routes RoutesInfo) {
+func (engine *Vira) Routes() (routes RoutesInfo) {
 	for _, tree := range engine.trees {
 		routes = iterate("", tree.method, routes, tree.root)
 	}
@@ -335,7 +335,7 @@ func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
 // Run attaches the router to a http.Server and starts listening and serving HTTP requests.
 // It is a shortcut for http.ListenAndServe(addr, router)
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
-func (engine *Engine) Run(addr ...string) (err error) {
+func (engine *Vira) Run(addr ...string) (err error) {
 	defer func() { debugPrintError(err) }()
 
 	if engine.isUnsafeTrustedProxies() {
@@ -349,7 +349,7 @@ func (engine *Engine) Run(addr ...string) (err error) {
 	return
 }
 
-func (engine *Engine) prepareTrustedCIDRs() ([]*net.IPNet, error) {
+func (engine *Vira) prepareTrustedCIDRs() ([]*net.IPNet, error) {
 	if engine.trustedProxies == nil {
 		return nil, nil
 	}
@@ -381,30 +381,30 @@ func (engine *Engine) prepareTrustedCIDRs() ([]*net.IPNet, error) {
 // SetTrustedProxies set a list of network origins (IPv4 addresses,
 // IPv4 CIDRs, IPv6 addresses or IPv6 CIDRs) from which to trust
 // request's headers that contain alternative client IP when
-// `(*vira.Engine).ForwardedByClientIP` is `true`. `TrustedProxies`
+// `(*vira.Vira).ForwardedByClientIP` is `true`. `TrustedProxies`
 // feature is enabled by default, and it also trusts all proxies
 // by default. If you want to disable this feature, use
-// Engine.SetTrustedProxies(nil), then Context.ClientIP() will
+// Vira.SetTrustedProxies(nil), then Context.ClientIP() will
 // return the remote address directly.
-func (engine *Engine) SetTrustedProxies(trustedProxies []string) error {
+func (engine *Vira) SetTrustedProxies(trustedProxies []string) error {
 	engine.trustedProxies = trustedProxies
 	return engine.parseTrustedProxies()
 }
 
-// isUnsafeTrustedProxies checks if Engine.trustedCIDRs contains all IPs, it's not safe if it has (returns true)
-func (engine *Engine) isUnsafeTrustedProxies() bool {
+// isUnsafeTrustedProxies checks if Vira.trustedCIDRs contains all IPs, it's not safe if it has (returns true)
+func (engine *Vira) isUnsafeTrustedProxies() bool {
 	return engine.isTrustedProxy(net.ParseIP("0.0.0.0")) || engine.isTrustedProxy(net.ParseIP("::"))
 }
 
-// parseTrustedProxies parse Engine.trustedProxies to Engine.trustedCIDRs
-func (engine *Engine) parseTrustedProxies() error {
+// parseTrustedProxies parse Vira.trustedProxies to Vira.trustedCIDRs
+func (engine *Vira) parseTrustedProxies() error {
 	trustedCIDRs, err := engine.prepareTrustedCIDRs()
 	engine.trustedCIDRs = trustedCIDRs
 	return err
 }
 
-// isTrustedProxy will check whether the IP address is included in the trusted list according to Engine.trustedCIDRs
-func (engine *Engine) isTrustedProxy(ip net.IP) bool {
+// isTrustedProxy will check whether the IP address is included in the trusted list according to Vira.trustedCIDRs
+func (engine *Vira) isTrustedProxy(ip net.IP) bool {
 	if engine.trustedCIDRs == nil {
 		return false
 	}
@@ -417,7 +417,7 @@ func (engine *Engine) isTrustedProxy(ip net.IP) bool {
 }
 
 // validateHeader will parse X-Forwarded-For header and return the trusted client IP address
-func (engine *Engine) validateHeader(header string) (clientIP string, valid bool) {
+func (engine *Vira) validateHeader(header string) (clientIP string, valid bool) {
 	if header == "" {
 		return "", false
 	}
@@ -455,7 +455,7 @@ func parseIP(ip string) net.IP {
 // RunTLS attaches the router to a http.Server and starts listening and serving HTTPS (secure) requests.
 // It is a shortcut for http.ListenAndServeTLS(addr, certFile, keyFile, router)
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
-func (engine *Engine) RunTLS(addr, certFile, keyFile string) (err error) {
+func (engine *Vira) RunTLS(addr, certFile, keyFile string) (err error) {
 	debugPrint("Listening and serving HTTPS on %s\n", addr)
 	defer func() { debugPrintError(err) }()
 
@@ -471,7 +471,7 @@ func (engine *Engine) RunTLS(addr, certFile, keyFile string) (err error) {
 // RunUnix attaches the router to a http.Server and starts listening and serving HTTP requests
 // through the specified unix socket (i.e. a file).
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
-func (engine *Engine) RunUnix(file string) (err error) {
+func (engine *Vira) RunUnix(file string) (err error) {
 	debugPrint("Listening and serving HTTP on unix:/%s", file)
 	defer func() { debugPrintError(err) }()
 
@@ -494,7 +494,7 @@ func (engine *Engine) RunUnix(file string) (err error) {
 // RunFd attaches the router to a http.Server and starts listening and serving HTTP requests
 // through the specified file descriptor.
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
-func (engine *Engine) RunFd(fd int) (err error) {
+func (engine *Vira) RunFd(fd int) (err error) {
 	debugPrint("Listening and serving HTTP on fd@%d", fd)
 	defer func() { debugPrintError(err) }()
 
@@ -515,7 +515,7 @@ func (engine *Engine) RunFd(fd int) (err error) {
 
 // RunListener attaches the router to a http.Server and starts listening and serving HTTP requests
 // through the specified net.Listener
-func (engine *Engine) RunListener(listener net.Listener) (err error) {
+func (engine *Vira) RunListener(listener net.Listener) (err error) {
 	debugPrint("Listening and serving HTTP on listener what's bind with address@%s", listener.Addr())
 	defer func() { debugPrintError(err) }()
 
@@ -529,7 +529,7 @@ func (engine *Engine) RunListener(listener net.Listener) (err error) {
 }
 
 // ServeHTTP conforms to the http.Handler interface.
-func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (engine *Vira) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := engine.pool.Get().(*Context)
 	c.writermem.reset(w)
 	c.Request = req
@@ -543,7 +543,7 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // HandleContext re-enters a context that has been rewritten.
 // This can be done by setting c.Request.URL.Path to your new target.
 // Disclaimer: You can loop yourself to deal with this, use wisely.
-func (engine *Engine) HandleContext(c *Context) {
+func (engine *Vira) HandleContext(c *Context) {
 	oldIndexValue := c.index
 	c.reset()
 	engine.handleHTTPRequest(c)
@@ -551,7 +551,7 @@ func (engine *Engine) HandleContext(c *Context) {
 	c.index = oldIndexValue
 }
 
-func (engine *Engine) handleHTTPRequest(c *Context) {
+func (engine *Vira) handleHTTPRequest(c *Context) {
 	httpMethod := c.Request.Method
 	rPath := c.Request.URL.Path
 	unescape := false
