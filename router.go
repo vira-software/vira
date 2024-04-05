@@ -1,350 +1,255 @@
 package vira
 
 import (
-	"context"
 	"net/http"
+	"path"
+	"regexp"
 	"strings"
 )
 
-// Router is a trie base HTTP request handler for vira which can be used to
-// dispatch requests to different handler functions.
-// A trivial example is:
-//
-//	package main
-//
-//	func SomeRouterMiddleware(ctx *vira.Context) error {
-//		// do some thing.
-//		fmt.Println("Router middleware...")
-//		return nil
-//	}
-//
-//	func ViewHello(ctx *vira.Context) error {
-//		return ctx.HTML(200, "<h1>Hello, vira!</h1>")
-//	}
-//
-//	func main() {
-//		app := vira.New()
-//		// Add app middleware
-//
-//		router := vira.NewRouter()
-//		router.Use(SomeRouterMiddleware) // Add router middleware, optionally
-//		router.Get("/", ViewHello)
-//
-//		app.UseHandler(router)
-//		app.Error(app.Listen(":3000"))
-//	}
-//
-// The router matches incoming requests by the request method and the path.
-// If a handle is registered for this path and method, the router delegates the
-// request to that function.
-//
-// The registered path, against which the router matches incoming requests, can
-// contain six types of parameters:
-//
-//	| Syntax | Description |
-//	|--------|------|
-//	| `:name` | named parameter |
-//	| `:name(regexp)` | named with regexp parameter |
-//	| `:name+suffix` | named parameter with suffix matching |
-//	| `:name(regexp)+suffix` | named with regexp parameter and suffix matching |
-//	| `:name*` | named with catch-all parameter |
-//	| `::name` | not named parameter, it is literal `:name` |
-//
-// Named parameters are dynamic path segments. They match anything until the next '/' or the path end:
-//
-// Defined: `/api/:type/:ID`
-//
-//	/api/user/123             matched: type="user", ID="123"
-//	/api/user                 no match
-//	/api/user/123/comments    no match
-//
-// Named with regexp parameters match anything using regexp until the next '/' or the path end:
-//
-// Defined: `/api/:type/:ID(^\d+$)`
-//
-//	/api/user/123             matched: type="user", ID="123"
-//	/api/user                 no match
-//	/api/user/abc             no match
-//	/api/user/123/comments    no match
-//
-// Named parameters with suffix, such as [Google API Design](https://cloud.google.com/apis/design/custom_methods):
-//
-// Defined: `/api/:resource/:ID+:undelete`
-//
-//	/api/file/123                     no match
-//	/api/file/123:undelete            matched: resource="file", ID="123"
-//	/api/file/123:undelete/comments   no match
-//
-// Named with regexp parameters and suffix:
-//
-// Defined: `/api/:resource/:ID(^\d+$)+:cancel`
-//
-//	/api/task/123                   no match
-//	/api/task/123:cancel            matched: resource="task", ID="123"
-//	/api/task/abc:cancel            no match
-//
-// Named with catch-all parameters match anything until the path end, including the directory index (the '/' before the catch-all). Since they match anything until the end, catch-all parameters must always be the final path element.
-//
-// Defined: `/files/:filepath*`
-//
-//	/files                           no match
-//	/files/LICENSE                   matched: filepath="LICENSE"
-//	/files/templates/article.html    matched: filepath="templates/article.html"
-//
-// The value of parameters is saved on the `Matched.Params`. Retrieve the value of a parameter by name:
-//
-//	type := matched.Params("type")
-//	id   := matched.Params("ID")
-type Router struct {
-	root       string
-	rt         string
-	trie       *Trie
-	otherwise  Middleware
-	middleware Middleware
-	mds        []Middleware
-}
+var (
+	// regEnLetter matches english letters for http method name
+	regEnLetter = regexp.MustCompile("^[A-Z]+$")
 
-// RouterOptions is options for Router
-type RouterOptions struct {
-	// Router's namespace. vira supports multiple routers with different namespace.
-	// Root string should start with "/", default to "/"
-	Root string
-
-	// Ignore case when matching URL path.
-	IgnoreCase bool
-
-	// Enables automatic redirection if the current path can't be matched but
-	// a handler for the fixed path exists.
-	// For example if "/api//foo" is requested but a route only exists for "/api/foo", the
-	// client is redirected to "/api/foo"" with http status code 301 for GET requests
-	// and 307 for all other request methods.
-	FixedPathRedirect bool
-
-	// Enables automatic redirection if the current route can't be matched but a
-	// handler for the path with (without) the trailing slash exists.
-	// For example if "/foo/" is requested but a route only exists for "/foo", the
-	// client is redirected to "/foo"" with http status code 301 for GET requests
-	// and 307 for all other request methods.
-	TrailingSlashRedirect bool
-}
-
-var defaultRouterOptions = RouterOptions{
-	Root:                  "/",
-	IgnoreCase:            true,
-	FixedPathRedirect:     true,
-	TrailingSlashRedirect: true,
-}
-
-// NewRouter returns a new Router instance with root path and ignoreCase option.
-// vira support multi-routers. For example:
-//
-//	// Create app
-//	app := vira.New()
-//
-//	// Create views router
-//	viewRouter := vira.NewRouter()
-//	viewRouter.Get("/", Ctl.IndexView)
-//	// add more ...
-//
-//	apiRouter := vira.NewRouter(RouterOptions{
-//		Root: "/api",
-//		IgnoreCase: true,
-//		FixedPathRedirect: true,
-//		TrailingSlashRedirect: true,
-//	})
-//	// support one more middleware
-//	apiRouter.Get("/user/:id", API.Auth, API.User)
-//	// add more ..
-//
-//	app.UseHandler(apiRouter) // Must add apiRouter first.
-//	app.UseHandler(viewRouter)
-//	// Start app at 3000
-//	app.Listen(":3000")
-func NewRouter(routerOptions ...RouterOptions) *Router {
-	opts := defaultRouterOptions
-	if len(routerOptions) > 0 {
-		opts = routerOptions[0]
+	// anyMethods for RouterGroup Any method
+	anyMethods = []string{
+		http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodHead, http.MethodOptions, http.MethodDelete, http.MethodConnect,
+		http.MethodTrace,
 	}
-	if opts.Root == "" || opts.Root[len(opts.Root)-1] != '/' {
-		opts.Root += "/"
-	}
+)
 
-	return &Router{
-		root: opts.Root,
-		rt:   opts.Root[0 : len(opts.Root)-1],
-		mds:  make([]Middleware, 0),
-		trie: NewTrie(Options{
-			IgnoreCase:            opts.IgnoreCase,
-			FixedPathRedirect:     opts.FixedPathRedirect,
-			TrailingSlashRedirect: opts.TrailingSlashRedirect,
-		}),
+// IRouter defines all router handle interface includes single and group router.
+type IRouter interface {
+	IRoutes
+	Group(string, ...HandlerFunc) *RouterGroup
+}
+
+// IRoutes defines all router handle interface.
+type IRoutes interface {
+	Use(...HandlerFunc) IRoutes
+
+	Handle(string, string, ...HandlerFunc) IRoutes
+	Any(string, ...HandlerFunc) IRoutes
+	GET(string, ...HandlerFunc) IRoutes
+	POST(string, ...HandlerFunc) IRoutes
+	DELETE(string, ...HandlerFunc) IRoutes
+	PATCH(string, ...HandlerFunc) IRoutes
+	PUT(string, ...HandlerFunc) IRoutes
+	OPTIONS(string, ...HandlerFunc) IRoutes
+	HEAD(string, ...HandlerFunc) IRoutes
+	Match([]string, string, ...HandlerFunc) IRoutes
+
+	StaticFile(string, string) IRoutes
+	StaticFileFS(string, string, http.FileSystem) IRoutes
+	Static(string, string) IRoutes
+	StaticFS(string, http.FileSystem) IRoutes
+}
+
+// RouterGroup is used internally to configure router, a RouterGroup is associated with
+// a prefix and an array of handlers (middleware).
+type RouterGroup struct {
+	Handlers HandlersChain
+	basePath string
+	engine   *Vira
+	root     bool
+}
+
+var _ IRouter = (*RouterGroup)(nil)
+
+// Use adds middleware to the group, see example code in GitHub.
+func (group *RouterGroup) Use(middleware ...HandlerFunc) IRoutes {
+	group.Handlers = append(group.Handlers, middleware...)
+	return group.returnObj()
+}
+
+// Group creates a new router group. You should add all the routes that have common middlewares or the same path prefix.
+// For example, all the routes that use a common middleware for authorization could be grouped.
+func (group *RouterGroup) Group(relativePath string, handlers ...HandlerFunc) *RouterGroup {
+	return &RouterGroup{
+		Handlers: group.combineHandlers(handlers),
+		basePath: group.calculateAbsolutePath(relativePath),
+		engine:   group.engine,
 	}
 }
 
-// Use registers a new Middleware in the router, that will be called when router mathed.
-func (r *Router) Use(handle Middleware) *Router {
-	r.mds = append(r.mds, handle)
-	r.middleware = Compose(r.mds...)
-	return r
+// BasePath returns the base path of router group.
+// For example, if v := router.Group("/rest/n/v1/api"), v.BasePath() is "/rest/n/v1/api".
+func (group *RouterGroup) BasePath() string {
+	return group.basePath
 }
 
-// Handle registers a new Middleware handler with method and path in the router.
+func (group *RouterGroup) handle(httpMethod, relativePath string, handlers HandlersChain) IRoutes {
+	absolutePath := group.calculateAbsolutePath(relativePath)
+	handlers = group.combineHandlers(handlers)
+	group.engine.addRoute(httpMethod, absolutePath, handlers)
+	return group.returnObj()
+}
+
+// Handle registers a new request handle and middleware with the given path and method.
+// The last handler should be the real handler, the other ones should be middleware that can and should be shared among different routes.
+// See the example code in GitHub.
+//
 // For GET, POST, PUT, PATCH and DELETE requests the respective shortcut
 // functions can be used.
 //
 // This function is intended for bulk loading and to allow the usage of less
 // frequently used, non-standardized or custom methods (e.g. for internal
 // communication with a proxy).
-func (r *Router) Handle(method, pattern string, handlers ...Middleware) *Router {
-	if method == "" {
-		panic(ViraErr.WithMsg("invalid method"))
+func (group *RouterGroup) Handle(httpMethod, relativePath string, handlers ...HandlerFunc) IRoutes {
+	if matched := regEnLetter.MatchString(httpMethod); !matched {
+		panic("http method " + httpMethod + " is not valid")
 	}
-	if len(handlers) == 0 {
-		panic(ViraErr.WithMsg("invalid middleware"))
-	}
-	r.trie.Define(pattern).Handle(strings.ToUpper(method), Compose(handlers...))
-	return r
+	return group.handle(httpMethod, relativePath, handlers)
 }
 
-// Get registers a new GET route for a path with matching handler in the router.
-func (r *Router) Get(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodGet, pattern, handlers...)
+// POST is a shortcut for router.Handle("POST", path, handlers).
+func (group *RouterGroup) POST(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodPost, relativePath, handlers)
 }
 
-// Head registers a new HEAD route for a path with matching handler in the router.
-func (r *Router) Head(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodHead, pattern, handlers...)
+// GET is a shortcut for router.Handle("GET", path, handlers).
+func (group *RouterGroup) GET(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodGet, relativePath, handlers)
 }
 
-// Post registers a new POST route for a path with matching handler in the router.
-func (r *Router) Post(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodPost, pattern, handlers...)
+// DELETE is a shortcut for router.Handle("DELETE", path, handlers).
+func (group *RouterGroup) DELETE(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodDelete, relativePath, handlers)
 }
 
-// Put registers a new PUT route for a path with matching handler in the router.
-func (r *Router) Put(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodPut, pattern, handlers...)
+// PATCH is a shortcut for router.Handle("PATCH", path, handlers).
+func (group *RouterGroup) PATCH(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodPatch, relativePath, handlers)
 }
 
-// Patch registers a new PATCH route for a path with matching handler in the router.
-func (r *Router) Patch(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodPatch, pattern, handlers...)
+// PUT is a shortcut for router.Handle("PUT", path, handlers).
+func (group *RouterGroup) PUT(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodPut, relativePath, handlers)
 }
 
-// Delete registers a new DELETE route for a path with matching handler in the router.
-func (r *Router) Delete(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodDelete, pattern, handlers...)
+// OPTIONS is a shortcut for router.Handle("OPTIONS", path, handlers).
+func (group *RouterGroup) OPTIONS(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodOptions, relativePath, handlers)
 }
 
-// Options registers a new OPTIONS route for a path with matching handler in the router.
-func (r *Router) Options(pattern string, handlers ...Middleware) *Router {
-	return r.Handle(http.MethodOptions, pattern, handlers...)
+// HEAD is a shortcut for router.Handle("HEAD", path, handlers).
+func (group *RouterGroup) HEAD(relativePath string, handlers ...HandlerFunc) IRoutes {
+	return group.handle(http.MethodHead, relativePath, handlers)
 }
 
-// Otherwise registers a new Middleware handler in the router
-// that will run if there is no other handler matching.
-func (r *Router) Otherwise(handlers ...Middleware) *Router {
-	if len(handlers) == 0 {
-		panic(ViraErr.WithMsg("invalid middleware"))
-	}
-	r.otherwise = Compose(handlers...)
-	return r
-}
-
-// Serve implemented vira.Handler interface
-func (r *Router) Serve(ctx *Context) error {
-	path := ctx.Path
-	method := ctx.Method
-	var handler Middleware
-
-	if !strings.HasPrefix(path, r.root) && path != r.rt {
-		return nil
+// Any registers a route that matches all the HTTP methods.
+// GET, POST, PUT, PATCH, HEAD, OPTIONS, DELETE, CONNECT, TRACE.
+func (group *RouterGroup) Any(relativePath string, handlers ...HandlerFunc) IRoutes {
+	for _, method := range anyMethods {
+		group.handle(method, relativePath, handlers)
 	}
 
-	if path == r.rt {
-		path = "/"
-	} else if l := len(r.rt); l > 0 {
-		path = path[l:]
-	}
-
-	matched := r.trie.Match(path)
-
-	if matched.Node == nil {
-		// FixedPathRedirect or TrailingSlashRedirect
-		if matched.TSR != "" || matched.FPR != "" {
-			ctx.Req.URL.Path = matched.TSR
-			if matched.FPR != "" {
-				ctx.Req.URL.Path = matched.FPR
-			}
-			if len(r.root) > 1 {
-				ctx.Req.URL.Path = r.root + ctx.Req.URL.Path[1:]
-			}
-
-			code := http.StatusMovedPermanently
-			if method != "GET" {
-				code = http.StatusTemporaryRedirect
-			}
-			ctx.Status(code)
-			return ctx.Redirect(ctx.Req.URL.String())
-		}
-
-		if r.otherwise == nil {
-			return nil
-		}
-		handler = r.otherwise
-	} else {
-		ok := false
-		if handler, ok = matched.Node.GetHandler(method).(Middleware); !ok {
-			// OPTIONS support
-			if method == http.MethodOptions {
-				ctx.SetHeader(HeaderAllow, matched.Node.GetAllow())
-				return ctx.End(http.StatusNoContent)
-			}
-
-			if r.otherwise == nil {
-				// If no route handler is returned, it's a 405 error
-				ctx.SetHeader(HeaderAllow, matched.Node.GetAllow())
-				return ErrMethodNotAllowed.WithMsgf(`"%s" is not allowed in "%s"`, method, ctx.Path)
-			}
-			handler = r.otherwise
-		}
-	}
-
-	state := CtxValue[State](ctx)
-	if state == nil {
-		return ErrInternalServerError.WithMsg("state is nil")
-	}
-
-	state.RouterPrefix = r.rt
-	state.RouterMatched = matched
-	if len(r.mds) > 0 {
-		handler = Compose(r.middleware, handler)
-	}
-	return handler(ctx)
+	return group.returnObj()
 }
 
-// GetRouterNodeFromCtx returns matched Node from router
+// Match registers a route that matches the specified methods that you declared.
+func (group *RouterGroup) Match(methods []string, relativePath string, handlers ...HandlerFunc) IRoutes {
+	for _, method := range methods {
+		group.handle(method, relativePath, handlers)
+	}
+
+	return group.returnObj()
+}
+
+// StaticFile registers a single route in order to serve a single file of the local filesystem.
+// router.StaticFile("favicon.ico", "./resources/favicon.ico")
+func (group *RouterGroup) StaticFile(relativePath, filepath string) IRoutes {
+	return group.staticFileHandler(relativePath, func(c *Context) {
+		c.File(filepath)
+	})
+}
+
+// StaticFileFS works just like `StaticFile` but a custom `http.FileSystem` can be used instead..
+// router.StaticFileFS("favicon.ico", "./resources/favicon.ico", Dir{".", false})
+// Vira by default uses: vira.Dir()
+func (group *RouterGroup) StaticFileFS(relativePath, filepath string, fs http.FileSystem) IRoutes {
+	return group.staticFileHandler(relativePath, func(c *Context) {
+		c.FileFromFS(filepath, fs)
+	})
+}
+
+func (group *RouterGroup) staticFileHandler(relativePath string, handler HandlerFunc) IRoutes {
+	if strings.Contains(relativePath, ":") || strings.Contains(relativePath, "*") {
+		panic("URL parameters can not be used when serving a static file")
+	}
+	group.GET(relativePath, handler)
+	group.HEAD(relativePath, handler)
+	return group.returnObj()
+}
+
+// Static serves files from the given file system root.
+// Internally a http.FileServer is used, therefore http.NotFound is used instead
+// of the Router's NotFound handler.
+// To use the operating system's file system implementation,
+// use :
 //
-//	router.Get("/api/:type/:ID", func(ctx *Context) error {
-//		assert.Equal("/api/:type/:ID", GetRouterNodeFromCtx(ctx).GetPattern())
-//		return ctx.HTML(200, ctx.Param("type")+ctx.Param("ID"))
-//	})
-func GetRouterNodeFromCtx(ctx context.Context) *Node {
-	if state := CtxValue[State](ctx); state != nil && state.RouterMatched != nil {
-		return state.RouterMatched.Node
-	}
-	return nil
+//	router.Static("/static", "/var/www")
+func (group *RouterGroup) Static(relativePath, root string) IRoutes {
+	return group.StaticFS(relativePath, Dir(root, false))
 }
 
-// GetRouterPatternFromCtx returns matched Node from router
-//
-//	routerV2.Get("/api/:type/:ID", func(ctx *Context) error {
-//		assert.Equal("/v2/api/:type/:ID", GetRouterPatternFromCtx(ctx))
-//		return ctx.HTML(200, "ok")
-//	})
-func GetRouterPatternFromCtx(ctx context.Context) string {
-	if state := CtxValue[State](ctx); state != nil && state.RouterMatched != nil && state.RouterMatched.Node != nil {
-		return state.RouterPrefix + state.RouterMatched.Node.GetPattern()
+// StaticFS works just like `Static()` but a custom `http.FileSystem` can be used instead.
+// Vira by default uses: vira.Dir()
+func (group *RouterGroup) StaticFS(relativePath string, fs http.FileSystem) IRoutes {
+	if strings.Contains(relativePath, ":") || strings.Contains(relativePath, "*") {
+		panic("URL parameters can not be used when serving a static folder")
 	}
-	return ""
+	handler := group.createStaticHandler(relativePath, fs)
+	urlPattern := path.Join(relativePath, "/*filepath")
+
+	// Register GET and HEAD handlers
+	group.GET(urlPattern, handler)
+	group.HEAD(urlPattern, handler)
+	return group.returnObj()
+}
+
+func (group *RouterGroup) createStaticHandler(relativePath string, fs http.FileSystem) HandlerFunc {
+	absolutePath := group.calculateAbsolutePath(relativePath)
+	fileServer := http.StripPrefix(absolutePath, http.FileServer(fs))
+
+	return func(c *Context) {
+		if _, noListing := fs.(*onlyFilesFS); noListing {
+			c.Writer.WriteHeader(http.StatusNotFound)
+		}
+
+		file := c.Param("filepath")
+		// Check if file exists and/or if we have permission to access it
+		f, err := fs.Open(file)
+		if err != nil {
+			c.Writer.WriteHeader(http.StatusNotFound)
+			c.handlers = group.engine.noRoute
+			// Reset index
+			c.index = -1
+			return
+		}
+		f.Close()
+
+		fileServer.ServeHTTP(c.Writer, c.Request)
+	}
+}
+
+func (group *RouterGroup) combineHandlers(handlers HandlersChain) HandlersChain {
+	finalSize := len(group.Handlers) + len(handlers)
+	assert1(finalSize < int(abortIndex), "too many handlers")
+	mergedHandlers := make(HandlersChain, finalSize)
+	copy(mergedHandlers, group.Handlers)
+	copy(mergedHandlers[len(group.Handlers):], handlers)
+	return mergedHandlers
+}
+
+func (group *RouterGroup) calculateAbsolutePath(relativePath string) string {
+	return joinPaths(group.basePath, relativePath)
+}
+
+func (group *RouterGroup) returnObj() IRoutes {
+	if group.root {
+		return group.engine
+	}
+	return group
 }

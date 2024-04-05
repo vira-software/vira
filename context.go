@@ -1,899 +1,1066 @@
 package vira
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"encoding/xml"
-	"fmt"
+	"errors"
 	"io"
-	"mime"
+	"log"
+	"math"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
-	"reflect"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-	// "github.com/go-http-utils/cookie"
-	// "github.com/go-http-utils/negotiator"
+
+	"github.com/vira-software/vira/binding"
+	"github.com/vira-software/vira/render"
 )
 
-type contextKey int
-
+// Content-Type MIME of the most common data formats.
 const (
-	isInheritedContext contextKey = iota
-	isviraContext
+	MIMEJSON              = binding.MIMEJSON
+	MIMEHTML              = binding.MIMEHTML
+	MIMEXML               = binding.MIMEXML
+	MIMEXML2              = binding.MIMEXML2
+	MIMEPlain             = binding.MIMEPlain
+	MIMEPOSTForm          = binding.MIMEPOSTForm
+	MIMEMultipartPOSTForm = binding.MIMEMultipartPOSTForm
+	MIMEYAML              = binding.MIMEYAML
+	MIMETOML              = binding.MIMETOML
 )
 
-// Any interface is used by ctx.Any.
-type Any interface {
-	New(ctx *Context) (any, error)
-}
+// BodyBytesKey indicates a default body bytes key.
+const BodyBytesKey = "_vira/bodybyteskey"
 
-// BodyTemplate interface is used by ctx.ParseBody.
-type BodyTemplate interface {
-	Validate() error
-}
+// ContextKey is the key that a Context returns itself for.
+const ContextKey = "_vira/contextkey"
 
-// CtxWith returns a new context.Context with the value *T stored in it.
-func CtxWith[T any](parent context.Context, v *T) context.Context {
-	return context.WithValue(parent, reflect.TypeOf((*T)(nil)), v)
-}
+type ContextKeyType int
 
-// CtxValue returns the value *T stored in the context.Context, or nil if not stored.
-func CtxValue[T any](ctx context.Context) *T {
-	v, _ := ctx.Value(reflect.TypeOf((*T)(nil))).(*T)
-	return v
-}
+const ContextRequestKey ContextKeyType = 0
 
-// CtxDoIf calls the function fn with the value *T stored in the context.Context.
-// If the Value is not exist or not valid, the function fn will not be called.
-func CtxDoIf[T any, TI IsValid[T]](ctx context.Context, fn func(v *T)) {
-	if v := CtxValue[T](ctx); TI(v).Valid() {
-		fn(v)
-	}
-}
+// abortIndex represents a typical value used in abort functions.
+const abortIndex int8 = math.MaxInt8 >> 1
 
-// IsValid is a generic interface for `vira.CtxDoIf`.
-type IsValid[T any] interface {
-	*T
-	Valid() bool
-}
-
-// State is the recommended namespace for passing information through middleware
-// and handlers.
-//
-//	state := vira.CtxValue[vira.State](ctx)
-//	state.KV[userKey] = user
-type State struct {
-	// key/value store.
-	KV            map[any]any
-	RouterPrefix  string
-	RouterMatched *Matched
-}
-
-// Valid implements vira.IsValid interface.
-func (s *State) Valid() bool {
-	return s != nil && s.KV != nil
-}
-
-// Context represents the context of the current HTTP request. It holds request and
-// response objects, path, path parameters, data, registered handler and content.Context.
+// Context is the most important part of vira. It allows us to pass variables between middleware,
+// manage the flow, validate the JSON of a request and render a JSON response for example.
 type Context struct {
-	vira    *Vira
-	Req     *http.Request
-	Res     *Response
-	Cookies []*http.Cookie
+	writermem responseWriter
+	Request   *http.Request
+	Writer    ResponseWriter
 
-	Host    string
-	Method  string
-	Path    string
-	StartAt time.Time
+	Params   Params
+	handlers HandlersChain
+	index    int8
+	fullPath string
 
-	query     url.Values
-	ctx       context.Context
-	cancelCtx context.CancelFunc
-	done      <-chan struct{}
+	engine       *Vira
+	params       *Params
+	skippedNodes *[]skippedNode
+
+	// This mutex protects Keys map.
+	mu sync.RWMutex
+
+	// Keys is a key/value pair exclusively for the context of each request.
+	Keys map[string]any
+
+	// Errors is a list of errors attached to all the handlers/middlewares who used this context.
+	Errors errorMsgs
+
+	// Accepted defines a list of manually accepted formats for content negotiation.
+	Accepted []string
+
+	// queryCache caches the query result from c.Request.URL.Query().
+	queryCache url.Values
+
+	// formCache caches c.Request.PostForm, which contains the parsed form data from POST, PATCH,
+	// or PUT body parameters.
+	formCache url.Values
+
+	// SameSite allows a server to define a cookie attribute making it impossible for
+	// the browser to send this cookie along with cross-site requests.
+	sameSite http.SameSite
 }
 
-// NewContext creates an instance of Context. Export for testing middleware.
-func NewContext(app *Vira, w http.ResponseWriter, r *http.Request) *Context {
-	ctx := Context{
-		vira: app,
-		Res:  &Response{w: w, rw: w, handlerHeader: w.Header()},
+/************************************/
+/********** CONTEXT CREATION ********/
+/************************************/
 
-		Host:    r.Host,
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		StartAt: time.Now().UTC(),
+func (c *Context) reset() {
+	c.Writer = &c.writermem
+	c.Params = c.Params[:0]
+	c.handlers = nil
+	c.index = -1
 
-		// Cookies: cookie.New(w, r, app.keys...),
-		Cookies: r.Cookies(),
+	c.fullPath = ""
+	c.Keys = nil
+	c.Errors = c.Errors[:0]
+	c.Accepted = nil
+	c.queryCache = nil
+	c.formCache = nil
+	c.sameSite = 0
+	*c.params = (*c.params)[:0]
+	*c.skippedNodes = (*c.skippedNodes)[:0]
+}
+
+// Copy returns a copy of the current context that can be safely used outside the request's scope.
+// This has to be used when the context has to be passed to a goroutine.
+func (c *Context) Copy() *Context {
+	cp := Context{
+		writermem: c.writermem,
+		Request:   c.Request,
+		engine:    c.engine,
 	}
 
-	if app.serverName != "" {
-		ctx.SetHeader(HeaderServer, app.serverName)
+	cp.writermem.ResponseWriter = nil
+	cp.Writer = &cp.writermem
+	cp.index = abortIndex
+	cp.handlers = nil
+	cp.fullPath = c.fullPath
+
+	cKeys := c.Keys
+	cp.Keys = make(map[string]any, len(cKeys))
+	c.mu.RLock()
+	for k, v := range cKeys {
+		cp.Keys[k] = v
+	}
+	c.mu.RUnlock()
+
+	cParams := c.Params
+	cp.Params = make([]Param, len(cParams))
+	copy(cp.Params, cParams)
+
+	return &cp
+}
+
+// HandlerName returns the main handler's name. For example if the handler is "handleGetUsers()",
+// this function will return "main.handleGetUsers".
+func (c *Context) HandlerName() string {
+	return nameOfFunction(c.handlers.Last())
+}
+
+// HandlerNames returns a list of all registered handlers for this context in descending order,
+// following the semantics of HandlerName()
+func (c *Context) HandlerNames() []string {
+	hn := make([]string, 0, len(c.handlers))
+	for _, val := range c.handlers {
+		hn = append(hn, nameOfFunction(val))
+	}
+	return hn
+}
+
+// Handler returns the main handler.
+func (c *Context) Handler() HandlerFunc {
+	return c.handlers.Last()
+}
+
+// FullPath returns a matched route full path. For not found routes
+// returns an empty string.
+//
+//	router.GET("/user/:id", func(c *vira.Context) {
+//	    c.FullPath() == "/user/:id" // true
+//	})
+func (c *Context) FullPath() string {
+	return c.fullPath
+}
+
+/************************************/
+/*********** FLOW CONTROL ***********/
+/************************************/
+
+// Next should be used only inside middleware.
+// It executes the pending handlers in the chain inside the calling handler.
+// See example in GitHub.
+func (c *Context) Next() {
+	c.index++
+	for c.index < int8(len(c.handlers)) {
+		c.handlers[c.index](c)
+		c.index++
+	}
+}
+
+// IsAborted returns true if the current context was aborted.
+func (c *Context) IsAborted() bool {
+	return c.index >= abortIndex
+}
+
+// Abort prevents pending handlers from being called. Note that this will not stop the current handler.
+// Let's say you have an authorization middleware that validates that the current request is authorized.
+// If the authorization fails (ex: the password does not match), call Abort to ensure the remaining handlers
+// for this request are not called.
+func (c *Context) Abort() {
+	c.index = abortIndex
+}
+
+// AbortWithStatus calls `Abort()` and writes the headers with the specified status code.
+// For example, a failed attempt to authenticate a request could use: context.AbortWithStatus(401).
+func (c *Context) AbortWithStatus(code int) {
+	c.Status(code)
+	c.Writer.WriteHeaderNow()
+	c.Abort()
+}
+
+// AbortWithStatusJSON calls `Abort()` and then `JSON` internally.
+// This method stops the chain, writes the status code and return a JSON body.
+// It also sets the Content-Type as "application/json".
+func (c *Context) AbortWithStatusJSON(code int, jsonObj any) {
+	c.Abort()
+	c.JSON(code, jsonObj)
+}
+
+// AbortWithError calls `AbortWithStatus()` and `Error()` internally.
+// This method stops the chain, writes the status code and pushes the specified error to `c.Errors`.
+// See Context.Error() for more details.
+func (c *Context) AbortWithError(code int, err error) *Error {
+	c.AbortWithStatus(code)
+	return c.Error(err)
+}
+
+/************************************/
+/********* ERROR MANAGEMENT *********/
+/************************************/
+
+// Error attaches an error to the current context. The error is pushed to a list of errors.
+// It's a good idea to call Error for each error that occurred during the resolution of a request.
+// A middleware can be used to collect all the errors and push them to a database together,
+// print a log, or append it in the HTTP response.
+// Error will panic if err is nil.
+func (c *Context) Error(err error) *Error {
+	if err == nil {
+		panic("err is nil")
 	}
 
-	if app.timeout <= 0 {
-		ctx.ctx, ctx.cancelCtx = context.WithCancel(r.Context())
+	var parsedError *Error
+	ok := errors.As(err, &parsedError)
+	if !ok {
+		parsedError = &Error{
+			Err:  err,
+			Type: ErrorTypePrivate,
+		}
+	}
+
+	c.Errors = append(c.Errors, parsedError)
+	return parsedError
+}
+
+/************************************/
+/******** METADATA MANAGEMENT********/
+/************************************/
+
+// Set is used to store a new key/value pair exclusively for this context.
+// It also lazy initializes  c.Keys if it was not used previously.
+func (c *Context) Set(key string, value any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Keys == nil {
+		c.Keys = make(map[string]any)
+	}
+
+	c.Keys[key] = value
+}
+
+// Get returns the value for the given key, ie: (value, true).
+// If the value does not exist it returns (nil, false)
+func (c *Context) Get(key string) (value any, exists bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	value, exists = c.Keys[key]
+	return
+}
+
+// MustGet returns the value for the given key if it exists, otherwise it panics.
+func (c *Context) MustGet(key string) any {
+	if value, exists := c.Get(key); exists {
+		return value
+	}
+	panic("Key \"" + key + "\" does not exist")
+}
+
+// GetString returns the value associated with the key as a string.
+func (c *Context) GetString(key string) (s string) {
+	if val, ok := c.Get(key); ok && val != nil {
+		s, _ = val.(string)
+	}
+	return
+}
+
+// GetBool returns the value associated with the key as a boolean.
+func (c *Context) GetBool(key string) (b bool) {
+	if val, ok := c.Get(key); ok && val != nil {
+		b, _ = val.(bool)
+	}
+	return
+}
+
+// GetInt returns the value associated with the key as an integer.
+func (c *Context) GetInt(key string) (i int) {
+	if val, ok := c.Get(key); ok && val != nil {
+		i, _ = val.(int)
+	}
+	return
+}
+
+// GetInt64 returns the value associated with the key as an integer.
+func (c *Context) GetInt64(key string) (i64 int64) {
+	if val, ok := c.Get(key); ok && val != nil {
+		i64, _ = val.(int64)
+	}
+	return
+}
+
+// GetUint returns the value associated with the key as an unsigned integer.
+func (c *Context) GetUint(key string) (ui uint) {
+	if val, ok := c.Get(key); ok && val != nil {
+		ui, _ = val.(uint)
+	}
+	return
+}
+
+// GetUint64 returns the value associated with the key as an unsigned integer.
+func (c *Context) GetUint64(key string) (ui64 uint64) {
+	if val, ok := c.Get(key); ok && val != nil {
+		ui64, _ = val.(uint64)
+	}
+	return
+}
+
+// GetFloat64 returns the value associated with the key as a float64.
+func (c *Context) GetFloat64(key string) (f64 float64) {
+	if val, ok := c.Get(key); ok && val != nil {
+		f64, _ = val.(float64)
+	}
+	return
+}
+
+// GetTime returns the value associated with the key as time.
+func (c *Context) GetTime(key string) (t time.Time) {
+	if val, ok := c.Get(key); ok && val != nil {
+		t, _ = val.(time.Time)
+	}
+	return
+}
+
+// GetDuration returns the value associated with the key as a duration.
+func (c *Context) GetDuration(key string) (d time.Duration) {
+	if val, ok := c.Get(key); ok && val != nil {
+		d, _ = val.(time.Duration)
+	}
+	return
+}
+
+// GetStringSlice returns the value associated with the key as a slice of strings.
+func (c *Context) GetStringSlice(key string) (ss []string) {
+	if val, ok := c.Get(key); ok && val != nil {
+		ss, _ = val.([]string)
+	}
+	return
+}
+
+// GetStringMap returns the value associated with the key as a map of interfaces.
+func (c *Context) GetStringMap(key string) (sm map[string]any) {
+	if val, ok := c.Get(key); ok && val != nil {
+		sm, _ = val.(map[string]any)
+	}
+	return
+}
+
+// GetStringMapString returns the value associated with the key as a map of strings.
+func (c *Context) GetStringMapString(key string) (sms map[string]string) {
+	if val, ok := c.Get(key); ok && val != nil {
+		sms, _ = val.(map[string]string)
+	}
+	return
+}
+
+// GetStringMapStringSlice returns the value associated with the key as a map to a slice of strings.
+func (c *Context) GetStringMapStringSlice(key string) (smss map[string][]string) {
+	if val, ok := c.Get(key); ok && val != nil {
+		smss, _ = val.(map[string][]string)
+	}
+	return
+}
+
+/************************************/
+/************ INPUT DATA ************/
+/************************************/
+
+// Param returns the value of the URL param.
+// It is a shortcut for c.Params.ByName(key)
+//
+//	router.GET("/user/:id", func(c *vira.Context) {
+//	    // a GET request to /user/john
+//	    id := c.Param("id") // id == "john"
+//	    // a GET request to /user/john/
+//	    id := c.Param("id") // id == "/john/"
+//	})
+func (c *Context) Param(key string) string {
+	return c.Params.ByName(key)
+}
+
+// AddParam adds param to context and
+// replaces path param key with given value for e2e testing purposes
+// Example Route: "/user/:id"
+// AddParam("id", 1)
+// Result: "/user/1"
+func (c *Context) AddParam(key, value string) {
+	c.Params = append(c.Params, Param{Key: key, Value: value})
+}
+
+// Query returns the keyed url query value if it exists,
+// otherwise it returns an empty string `("")`.
+// It is shortcut for `c.Request.URL.Query().Get(key)`
+//
+//	    GET /path?id=1234&name=Vira&value=
+//		   c.Query("id") == "1234"
+//		   c.Query("name") == "Vira"
+//		   c.Query("value") == ""
+//		   c.Query("wtf") == ""
+func (c *Context) Query(key string) (value string) {
+	value, _ = c.GetQuery(key)
+	return
+}
+
+// DefaultQuery returns the keyed url query value if it exists,
+// otherwise it returns the specified defaultValue string.
+// See: Query() and GetQuery() for further information.
+//
+//	GET /?name=Vira&lastname=
+//	c.DefaultQuery("name", "unknown") == "Vira"
+//	c.DefaultQuery("id", "none") == "none"
+//	c.DefaultQuery("lastname", "none") == ""
+func (c *Context) DefaultQuery(key, defaultValue string) string {
+	if value, ok := c.GetQuery(key); ok {
+		return value
+	}
+	return defaultValue
+}
+
+// GetQuery is like Query(), it returns the keyed url query value
+// if it exists `(value, true)` (even when the value is an empty string),
+// otherwise it returns `("", false)`.
+// It is shortcut for `c.Request.URL.Query().Get(key)`
+//
+//	GET /?name=Vira&lastname=
+//	("Vira", true) == c.GetQuery("name")
+//	("", false) == c.GetQuery("id")
+//	("", true) == c.GetQuery("lastname")
+func (c *Context) GetQuery(key string) (string, bool) {
+	if values, ok := c.GetQueryArray(key); ok {
+		return values[0], ok
+	}
+	return "", false
+}
+
+// QueryArray returns a slice of strings for a given query key.
+// The length of the slice depends on the number of params with the given key.
+func (c *Context) QueryArray(key string) (values []string) {
+	values, _ = c.GetQueryArray(key)
+	return
+}
+
+func (c *Context) initQueryCache() {
+	if c.queryCache == nil {
+		if c.Request != nil {
+			c.queryCache = c.Request.URL.Query()
+		} else {
+			c.queryCache = url.Values{}
+		}
+	}
+}
+
+// GetQueryArray returns a slice of strings for a given query key, plus
+// a boolean value whether at least one value exists for the given key.
+func (c *Context) GetQueryArray(key string) (values []string, ok bool) {
+	c.initQueryCache()
+	values, ok = c.queryCache[key]
+	return
+}
+
+// QueryMap returns a map for a given query key.
+func (c *Context) QueryMap(key string) (dicts map[string]string) {
+	dicts, _ = c.GetQueryMap(key)
+	return
+}
+
+// GetQueryMap returns a map for a given query key, plus a boolean value
+// whether at least one value exists for the given key.
+func (c *Context) GetQueryMap(key string) (map[string]string, bool) {
+	c.initQueryCache()
+	return c.get(c.queryCache, key)
+}
+
+// get is an internal method and returns a map which satisfies conditions.
+func (c *Context) get(m map[string][]string, key string) (map[string]string, bool) {
+	dicts := make(map[string]string)
+	exist := false
+	for k, v := range m {
+		if i := strings.IndexByte(k, '['); i >= 1 && k[0:i] == key {
+			if j := strings.IndexByte(k[i+1:], ']'); j >= 1 {
+				exist = true
+				dicts[k[i+1:][:j]] = v[0]
+			}
+		}
+	}
+	return dicts, exist
+}
+
+// FormFile returns the first file for the provided form key.
+func (c *Context) FormFile(name string) (*multipart.FileHeader, error) {
+	if c.Request.MultipartForm == nil {
+		if err := c.Request.ParseMultipartForm(c.engine.MaxMultipartMemory); err != nil {
+			return nil, err
+		}
+	}
+	f, fh, err := c.Request.FormFile(name)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	return fh, err
+}
+
+// SaveUploadedFile uploads the form file to specific dst.
+func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error {
+	src, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	if err = os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
+		return err
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, src)
+	return err
+}
+
+// ShouldBind checks the Method and Content-Type to select a binding engine automatically,
+// Depending on the "Content-Type" header different bindings are used, for example:
+//
+//	"application/json" --> JSON binding
+//	"application/xml"  --> XML binding
+//
+// It parses the request's body as JSON if Content-Type == "application/json" using JSON or XML as a JSON input.
+// It decodes the json payload into the struct specified as a pointer.
+// Like c.Bind() but this method does not set the response status code to 400 or abort if input is not valid.
+func (c *Context) Bind(obj any) error {
+	b := binding.Default(c.Request.Method, c.ContentType())
+	return c.BindWith(obj, b)
+}
+
+// ShouldBindJSON is a shortcut for c.ShouldBindWith(obj, binding.JSON).
+func (c *Context) BindJSON(obj any) error {
+	return c.BindWith(obj, binding.JSON)
+}
+
+// ShouldBindXML is a shortcut for c.ShouldBindWith(obj, binding.XML).
+func (c *Context) BindXML(obj any) error {
+	return c.BindWith(obj, binding.XML)
+}
+
+// ShouldBindQuery is a shortcut for c.ShouldBindWith(obj, binding.Query).
+func (c *Context) BindQuery(obj any) error {
+	return c.BindWith(obj, binding.Query)
+}
+
+// ShouldBindYAML is a shortcut for c.ShouldBindWith(obj, binding.YAML).
+func (c *Context) BindYAML(obj any) error {
+	return c.BindWith(obj, binding.YAML)
+}
+
+// ShouldBindHeader is a shortcut for c.ShouldBindWith(obj, binding.Header).
+func (c *Context) BindHeader(obj any) error {
+	return c.BindWith(obj, binding.Header)
+}
+
+// ShouldBindUri binds the passed struct pointer using the specified binding engine.
+func (c *Context) BindUri(obj any) error {
+	m := make(map[string][]string)
+	for _, v := range c.Params {
+		m[v.Key] = []string{v.Value}
+	}
+	return binding.Uri.BindUri(m, obj)
+}
+
+// ShouldBindWith binds the passed struct pointer using the specified binding engine.
+// See the binding package.
+func (c *Context) BindWith(obj any, b binding.Binding) error {
+	return b.Bind(c.Request, obj)
+}
+
+// ShouldBindBodyWith is similar with ShouldBindWith, but it stores the request
+// body into the context, and reuse when it is called again.
+//
+// NOTE: This method reads the body before binding. So you should use
+// ShouldBindWith for better performance if you need to call only once.
+func (c *Context) BindBodyWith(obj any, bb binding.BindingBody) (err error) {
+	var body []byte
+	if cb, ok := c.Get(BodyBytesKey); ok {
+		if cbb, ok := cb.([]byte); ok {
+			body = cbb
+		}
+	}
+	if body == nil {
+		body, err = io.ReadAll(c.Request.Body)
+		if err != nil {
+			return err
+		}
+		c.Set(BodyBytesKey, body)
+	}
+	return bb.BindBody(body, obj)
+}
+
+// ShouldBindBodyWithJSON is a shortcut for c.ShouldBindBodyWith(obj, binding.JSON).
+func (c *Context) BindBodyWithJSON(obj any) error {
+	return c.BindBodyWith(obj, binding.JSON)
+}
+
+// ShouldBindBodyWithXML is a shortcut for c.ShouldBindBodyWith(obj, binding.XML).
+func (c *Context) BindBodyWithXML(obj any) error {
+	return c.BindBodyWith(obj, binding.XML)
+}
+
+// ShouldBindBodyWithYAML is a shortcut for c.ShouldBindBodyWith(obj, binding.YAML).
+func (c *Context) BindBodyWithYAML(obj any) error {
+	return c.BindBodyWith(obj, binding.YAML)
+}
+
+// ClientIP implements one best effort algorithm to return the real client IP.
+// It calls c.RemoteIP() under the hood, to check if the remote IP is a trusted proxy or not.
+// If it is it will then try to parse the headers defined in Vira.RemoteIPHeaders (defaulting to [X-Forwarded-For, X-Real-Ip]).
+// If the headers are not syntactically valid OR the remote IP does not correspond to a trusted proxy,
+// the remote IP (coming from Request.RemoteAddr) is returned.
+func (c *Context) ClientIP() string {
+	// Check if we're running on a trusted platform, continue running backwards if error
+	if c.engine.TrustedPlatform != "" {
+		// Developers can define their own header of Trusted Platform or use predefined constants
+		if addr := c.requestHeader(c.engine.TrustedPlatform); addr != "" {
+			return addr
+		}
+	}
+
+	// Legacy "AppVira" flag
+	if c.engine.AppVira {
+		log.Println(`The AppVira flag is going to be deprecated. Please check issues #2723 and #2739 and use 'TrustedPlatform: vira.PlatformGoogleAppVira' instead.`)
+		if addr := c.requestHeader("X-Appengine-Remote-Addr"); addr != "" {
+			return addr
+		}
+	}
+
+	// It also checks if the remoteIP is a trusted proxy or not.
+	// In order to perform this validation, it will see if the IP is contained within at least one of the CIDR blocks
+	// defined by Vira.SetTrustedProxies()
+	remoteIP := net.ParseIP(c.RemoteIP())
+	if remoteIP == nil {
+		return ""
+	}
+	trusted := c.engine.isTrustedProxy(remoteIP)
+
+	if trusted && c.engine.ForwardedByClientIP && c.engine.RemoteIPHeaders != nil {
+		for _, headerName := range c.engine.RemoteIPHeaders {
+			ip, valid := c.engine.validateHeader(c.requestHeader(headerName))
+			if valid {
+				return ip
+			}
+		}
+	}
+	return remoteIP.String()
+}
+
+// RemoteIP parses the IP from Request.RemoteAddr, normalizes and returns the IP (without the port).
+func (c *Context) RemoteIP() string {
+	ip, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr))
+	if err != nil {
+		return ""
+	}
+	return ip
+}
+
+// ContentType returns the Content-Type header of the request.
+func (c *Context) ContentType() string {
+	return filterFlags(c.requestHeader("Content-Type"))
+}
+
+// IsWebsocket returns true if the request headers indicate that a websocket
+// handshake is being initiated by the client.
+func (c *Context) IsWebsocket() bool {
+	if strings.Contains(strings.ToLower(c.requestHeader("Connection")), "upgrade") &&
+		strings.EqualFold(c.requestHeader("Upgrade"), "websocket") {
+		return true
+	}
+	return false
+}
+
+func (c *Context) requestHeader(key string) string {
+	return c.Request.Header.Get(key)
+}
+
+/************************************/
+/******** RESPONSE RENDERING ********/
+/************************************/
+
+// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
+// Status sets the HTTP response code.
+func (c *Context) Status(code int) {
+	c.Writer.WriteHeader(code)
+}
+
+// Header is an intelligent shortcut for c.Writer.Header().Set(key, value).
+// It writes a header in the response.
+// If value == "", this method removes the header `c.Writer.Header().Del(key)`
+func (c *Context) Header(key, value string) {
+	if value == "" {
+		c.Writer.Header().Del(key)
+		return
+	}
+	c.Writer.Header().Set(key, value)
+}
+
+// GetHeader returns value from request headers.
+func (c *Context) GetHeader(key string) string {
+	return c.requestHeader(key)
+}
+
+// GetRawData returns stream data.
+func (c *Context) GetRawData() ([]byte, error) {
+	if c.Request.Body == nil {
+		return nil, errors.New("cannot read nil body")
+	}
+	return io.ReadAll(c.Request.Body)
+}
+
+// SetSameSite with cookie
+func (c *Context) SetSameSite(samesite http.SameSite) {
+	c.sameSite = samesite
+}
+
+// SetCookie adds a Set-Cookie header to the ResponseWriter's headers.
+// The provided cookie must have a valid Name. Invalid cookies may be
+// silently dropped.
+func (c *Context) SetCookie(name, value string, maxAge int, path, domain string, secure, httpOnly bool) {
+	if path == "" {
+		path = "/"
+	}
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     name,
+		Value:    url.QueryEscape(value),
+		MaxAge:   maxAge,
+		Path:     path,
+		Domain:   domain,
+		SameSite: c.sameSite,
+		Secure:   secure,
+		HttpOnly: httpOnly,
+	})
+}
+
+// Cookie returns the named cookie provided in the request or
+// ErrNoCookie if not found. And return the named cookie is unescaped.
+// If multiple cookies match the given name, only one cookie will
+// be returned.
+func (c *Context) Cookie(name string) (string, error) {
+	cookie, err := c.Request.Cookie(name)
+	if err != nil {
+		return "", err
+	}
+	val, _ := url.QueryUnescape(cookie.Value)
+	return val, nil
+}
+
+// Render writes the response headers and calls render.Render to render data.
+func (c *Context) Render(code int, r render.Render) {
+	c.Status(code)
+
+	if !bodyAllowedForStatus(code) {
+		r.WriteContentType(c.Writer)
+		c.Writer.WriteHeaderNow()
+		return
+	}
+
+	if err := r.Render(c.Writer); err != nil {
+		// Pushing error to c.Errors
+		_ = c.Error(err)
+		c.Abort()
+	}
+}
+
+// IndentedJSON serializes the given struct as pretty JSON (indented + endlines) into the response body.
+// It also sets the Content-Type as "application/json".
+// WARNING: we recommend using this only for development purposes since printing pretty JSON is
+// more CPU and bandwidth consuming. Use Context.JSON() instead.
+func (c *Context) IndentedJSON(code int, obj any) {
+	c.Render(code, render.IndentedJSON{Data: obj})
+}
+
+// SecureJSON serializes the given struct as Secure JSON into the response body.
+// Default prepends "while(1)," to response body if the given struct is array values.
+// It also sets the Content-Type as "application/json".
+func (c *Context) SecureJSON(code int, obj any) {
+	c.Render(code, render.SecureJSON{Prefix: c.engine.secureJSONPrefix, Data: obj})
+}
+
+// JSONP serializes the given struct as JSON into the response body.
+// It adds padding to response body to request data from a server residing in a different domain than the client.
+// It also sets the Content-Type as "application/javascript".
+func (c *Context) JSONP(code int, obj any) {
+	callback := c.DefaultQuery("callback", "")
+	if callback == "" {
+		c.Render(code, render.JSON{Data: obj})
+		return
+	}
+	c.Render(code, render.JsonpJSON{Callback: callback, Data: obj})
+}
+
+// JSON serializes the given struct as JSON into the response body.
+// It also sets the Content-Type as "application/json".
+func (c *Context) JSON(code int, obj any) {
+	c.Render(code, render.JSON{Data: obj})
+}
+
+// AsciiJSON serializes the given struct as JSON into the response body with unicode to ASCII string.
+// It also sets the Content-Type as "application/json".
+func (c *Context) AsciiJSON(code int, obj any) {
+	c.Render(code, render.AsciiJSON{Data: obj})
+}
+
+// PureJSON serializes the given struct as JSON into the response body.
+// PureJSON, unlike JSON, does not replace special html characters with their unicode entities.
+func (c *Context) PureJSON(code int, obj any) {
+	c.Render(code, render.PureJSON{Data: obj})
+}
+
+// XML serializes the given struct as XML into the response body.
+// It also sets the Content-Type as "application/xml".
+func (c *Context) XML(code int, obj any) {
+	c.Render(code, render.XML{Data: obj})
+}
+
+// YAML serializes the given struct as YAML into the response body.
+func (c *Context) YAML(code int, obj any) {
+	c.Render(code, render.YAML{Data: obj})
+}
+
+// ProtoBuf serializes the given struct as ProtoBuf into the response body.
+func (c *Context) ProtoBuf(code int, obj any) {
+	c.Render(code, render.ProtoBuf{Data: obj})
+}
+
+// Redirect returns an HTTP redirect to the specific location.
+func (c *Context) Redirect(code int, location string) {
+	c.Render(-1, render.Redirect{
+		Code:     code,
+		Location: location,
+		Request:  c.Request,
+	})
+}
+
+// DataFromReader writes the specified reader into the body stream and updates the HTTP code.
+func (c *Context) DataFromReader(code int, contentLength int64, contentType string, reader io.Reader, extraHeaders map[string]string) {
+	c.Render(code, render.Reader{
+		Headers:       extraHeaders,
+		ContentType:   contentType,
+		ContentLength: contentLength,
+		Reader:        reader,
+	})
+}
+
+// File writes the specified file into the body stream in an efficient way.
+func (c *Context) File(filepath string) {
+	http.ServeFile(c.Writer, c.Request, filepath)
+}
+
+// FileFromFS writes the specified file from http.FileSystem into the body stream in an efficient way.
+func (c *Context) FileFromFS(filepath string, fs http.FileSystem) {
+	defer func(old string) {
+		c.Request.URL.Path = old
+	}(c.Request.URL.Path)
+
+	c.Request.URL.Path = filepath
+
+	http.FileServer(fs).ServeHTTP(c.Writer, c.Request)
+}
+
+var quoteEscaper = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
+func escapeQuotes(s string) string {
+	return quoteEscaper.Replace(s)
+}
+
+// FileAttachment writes the specified file into the body stream in an efficient way
+// On the client side, the file will typically be downloaded with the given filename
+func (c *Context) FileAttachment(filepath, filename string) {
+	if isASCII(filename) {
+		c.Writer.Header().Set("Content-Disposition", `attachment; filename="`+escapeQuotes(filename)+`"`)
 	} else {
-		ctx.ctx, ctx.cancelCtx = context.WithTimeout(r.Context(), app.timeout)
+		c.Writer.Header().Set("Content-Disposition", `attachment; filename*=UTF-8''`+url.QueryEscape(filename))
 	}
+	http.ServeFile(c.Writer, c.Request, filepath)
+}
 
-	ctx.ctx = context.WithValue(ctx.ctx, isInheritedContext, struct{}{})
-	ctx.ctx = CtxWith(ctx.ctx, &State{KV: make(map[any]any)})
-
-	ctx.Req = r.WithContext(ctx.ctx)
-	if app.withContext != nil {
-		ctx.WithContext(app.withContext(ctx.Req))
+// Stream sends a streaming response and returns a boolean
+// indicates "Is client disconnected in middle of stream"
+func (c *Context) Stream(step func(w io.Writer) bool) bool {
+	w := c.Writer
+	clientGone := w.CloseNotify()
+	for {
+		select {
+		case <-clientGone:
+			return true
+		default:
+			keepOpen := step(w)
+			w.Flush()
+			if !keepOpen {
+				return false
+			}
+		}
 	}
-
-	ctx.done = ctx.ctx.Done()
-	return &ctx
 }
 
-// ----- implement context.Context interface ----- //
+/************************************/
+/******** CONTENT NEGOTIATION *******/
+/************************************/
 
-// Deadline returns the time when work done on behalf of this context
-// should be canceled.
-func (ctx *Context) Deadline() (time.Time, bool) {
-	return ctx.ctx.Deadline()
+// Negotiate contains all negotiations data.
+type Negotiate struct {
+	Offered  []string
+	HTMLName string
+	HTMLData any
+	JSONData any
+	XMLData  any
+	YAMLData any
+	Data     any
+	TOMLData any
 }
 
-// Done returns a channel that's closed when work done on behalf of this
-// context should be canceled.
-func (ctx *Context) Done() <-chan struct{} {
-	return ctx.ctx.Done()
+// Negotiate calls different Render according to acceptable Accept format.
+func (c *Context) Negotiate(code int, config Negotiate) {
+	switch c.NegotiateFormat(config.Offered...) {
+	case binding.MIMEJSON:
+		data := chooseData(config.JSONData, config.Data)
+		c.JSON(code, data)
+
+	case binding.MIMEXML:
+		data := chooseData(config.XMLData, config.Data)
+		c.XML(code, data)
+
+	case binding.MIMEYAML:
+		data := chooseData(config.YAMLData, config.Data)
+		c.YAML(code, data)
+
+	default:
+		c.AbortWithError(http.StatusNotAcceptable, errors.New("the accepted formats are not offered by the server")) //nolint: errcheck
+	}
 }
 
-// Err returns a non-nil error value after Done is closed.
-func (ctx *Context) Err() error {
-	return ctx.ctx.Err()
+// NegotiateFormat returns an acceptable Accept format.
+func (c *Context) NegotiateFormat(offered ...string) string {
+	assert1(len(offered) > 0, "you must provide at least one offer")
+
+	if c.Accepted == nil {
+		c.Accepted = parseAccept(c.requestHeader("Accept"))
+	}
+	if len(c.Accepted) == 0 {
+		return offered[0]
+	}
+	for _, accepted := range c.Accepted {
+		for _, offer := range offered {
+			// According to RFC 2616 and RFC 2396, non-ASCII characters are not allowed in headers,
+			// therefore we can just iterate over the string without casting it into []rune
+			i := 0
+			for ; i < len(accepted) && i < len(offer); i++ {
+				if accepted[i] == '*' || offer[i] == '*' {
+					return offer
+				}
+				if accepted[i] != offer[i] {
+					break
+				}
+			}
+			if i == len(accepted) {
+				return offer
+			}
+		}
+	}
+	return ""
+}
+
+// SetAccepted sets Accept header data.
+func (c *Context) SetAccepted(formats ...string) {
+	c.Accepted = formats
+}
+
+/************************************/
+/***** GOLANG.ORG/X/NET/CONTEXT *****/
+/************************************/
+
+// hasRequestContext returns whether c.Request has Context and fallback.
+func (c *Context) hasRequestContext() bool {
+	hasFallback := c.engine != nil && c.engine.ContextWithFallback
+	hasRequestContext := c.Request != nil && c.Request.Context() != nil
+	return hasFallback && hasRequestContext
+}
+
+// Deadline returns that there is no deadline (ok==false) when c.Request has no Context.
+func (c *Context) Deadline() (deadline time.Time, ok bool) {
+	if !c.hasRequestContext() {
+		return
+	}
+	return c.Request.Context().Deadline()
+}
+
+// Done returns nil (chan which will wait forever) when c.Request has no Context.
+func (c *Context) Done() <-chan struct{} {
+	if !c.hasRequestContext() {
+		return nil
+	}
+	return c.Request.Context().Done()
+}
+
+// Err returns nil when c.Request has no Context.
+func (c *Context) Err() error {
+	if !c.hasRequestContext() {
+		return nil
+	}
+	return c.Request.Context().Err()
 }
 
 // Value returns the value associated with this context for key, or nil
 // if no value is associated with key. Successive calls to Value with
 // the same key returns the same result.
-func (ctx *Context) Value(key any) (val any) {
-	if key == isviraContext {
-		return struct{}{}
+func (c *Context) Value(key any) any {
+	if key == ContextRequestKey {
+		return c.Request
 	}
-
-	return ctx.ctx.Value(key)
-}
-
-// Cancel cancel the ctx and all it' children context.
-// The ctx' process will ended too.
-func (ctx *Context) Cancel() {
-	ctx.Res.ended.setTrue() // end the middleware process
-	ctx.Res.afterHooks = nil
-	ctx.cancelCtx()
-}
-
-// WithCancel returns a copy of the ctx with a new Done channel.
-// The returned context's Done channel is closed when the returned cancel function is called or when the parent context's Done channel is closed, whichever happens first.
-func (ctx *Context) WithCancel() (context.Context, context.CancelFunc) {
-	return context.WithCancel(ctx.ctx)
-}
-
-// WithDeadline returns a copy of the ctx with the deadline adjusted to be no later than d.
-func (ctx *Context) WithDeadline(deadline time.Time) (context.Context, context.CancelFunc) {
-	return context.WithDeadline(ctx.ctx, deadline)
-}
-
-// WithTimeout returns WithDeadline(time.Now().Add(timeout)).
-func (ctx *Context) WithTimeout(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx.ctx, timeout)
-}
-
-// WithValue returns a copy of the ctx in which the value associated with key is val.
-func (ctx *Context) WithValue(key, val any) context.Context {
-	return context.WithValue(ctx.ctx, key, val)
-}
-
-// Context returns the underlying context of vira.Context
-func (ctx *Context) Context() context.Context {
-	return ctx.ctx
-}
-
-// WithContext sets the context to underlying vira.Context.
-// The context must be a children or a grandchild of vira.Context.
-//
-//	ctx.WithContext(ctx.WithValue("key", "value"))
-//	// ctx.Value("key") == "value"
-func (ctx *Context) WithContext(c context.Context) {
-	if c.Value(isviraContext) != nil {
-		panic(ViraErr.WithMsg("should not use *vira.Context as parent context, please use ctx.Context()"))
+	if key == ContextKey {
+		return c
 	}
-	if c.Value(isInheritedContext) == nil {
-		panic(ViraErr.WithMsg("the context is not created from ctx.Context()"))
-	}
-
-	ctx.Req = ctx.Req.WithContext(c)
-	ctx.ctx = c
-}
-
-// LogErr writes error to underlayer logging system through app.Error.
-func (ctx *Context) LogErr(err error) {
-	ctx.vira.Error(err)
-}
-
-// Timing runs fn with the given time limit. If a call runs for longer than its time limit or panic,
-// it will return context.DeadlineExceeded error or panic error.
-func (ctx *Context) Timing(dt time.Duration, fn func(context.Context)) (err error) {
-	ct, cancel := ctx.WithTimeout(dt)
-	defer cancel()
-
-	ch := make(chan error, 1) // not block tryRunTiming
-	go tryRunTiming(ct, fn, ch)
-
-	select {
-	case <-ct.Done():
-		err = ct.Err()
-	case err = <-ch:
-	}
-	return
-}
-
-// Any returns the value on this ctx by key. If key is instance of Any and
-// value not set, any.New will be called to eval the value, and then set to the ctx.
-// if any.New returns error, the value will not be set.
-//
-//	// create some Any type for your project.
-//	type someAnyType struct{}
-//	type someAnyResult struct {
-//		r *http.Request
-//	}
-//
-//	var someAnyKey = &someAnyType{}
-//
-//	func (t *someAnyType) New(ctx *vira.Context) (any, error) {
-//		return &someAnyResult{r: ctx.Req}, nil
-//	}
-//
-//	// use it in app
-//	if val, err := ctx.Any(someAnyKey); err == nil {
-//		res := val.(*someAnyResult)
-//	}
-func (ctx *Context) Any(any any) (val any, err error) {
-	var ok bool
-	state := CtxValue[State](ctx.ctx)
-	if val, ok = state.KV[any]; !ok {
-		switch v := any.(type) {
-		case Any:
-			if val, err = v.New(ctx); err == nil {
-				state.KV[any] = val
-			}
-		default:
-			return nil, ViraErr.WithMsg("non-existent key")
-		}
-	}
-	return
-}
-
-// MustAny returns the value on this ctx by key. It is a sugar for ctx.Any,
-// If some error occurred, it will panic.
-func (ctx *Context) MustAny(any any) any {
-	val, err := ctx.Any(any)
-	if err != nil {
-		panic(err)
-	}
-	return val
-}
-
-// SetAny save a key, value pair on the ctx.
-// Then we can use ctx.Any(key) to retrieve the value from ctx.
-func (ctx *Context) SetAny(key, val any) {
-	state := CtxValue[State](ctx.ctx)
-	state.KV[key] = val
-}
-
-// Setting returns App's settings by key
-//
-//	fmt.Println(ctx.Setting(vira.SetEnv).(string) == "development")
-//	app.Set(vira.SetEnv, "production")
-//	fmt.Println(ctx.Setting(vira.SetEnv).(string) == "production")
-func (ctx *Context) Setting(key any) any {
-	if val, ok := ctx.vira.settings[key]; ok {
-		return val
-	}
-	return nil
-}
-
-// IP returns the client's network address based on `X-Forwarded-For`
-// or `X-Real-IP` request header.
-// The trustedProxy argument will be removed in v2.
-func (ctx *Context) IP(trustedProxy ...bool) net.IP {
-	trusted := ctx.Setting(SetTrustedProxy).(bool)
-	if len(trustedProxy) > 0 {
-		trusted = trustedProxy[0]
-	}
-
-	var ip string
-	if trusted {
-		ip = ctx.Req.Header.Get(HeaderXRealIP)
-
-		if ip == "" {
-			ip = ctx.Req.Header.Get(HeaderXForwardedFor)
-			if i := strings.IndexByte(ip, ','); i > 0 {
-				ip = ip[0:i]
-			}
-		}
-	}
-	if ip == "" {
-		ra := ctx.Req.RemoteAddr
-		ip, _, _ = net.SplitHostPort(ra)
-	}
-
-	return net.ParseIP(ip)
-}
-
-// Protocol -  Please use ctx.Scheme instead. This method will be changed in v2.
-func (ctx *Context) Protocol(trustedProxy ...bool) string {
-	return ctx.Scheme(trustedProxy...)
-}
-
-// Scheme returns the scheme ("http", "https", "ws", "wss") that a client used to connect to your proxy or load balancer.
-// The trustedProxy argument will be removed in v2.
-func (ctx *Context) Scheme(trustedProxy ...bool) string {
-	trusted := ctx.Setting(SetTrustedProxy).(bool)
-	if len(trustedProxy) > 0 {
-		trusted = trustedProxy[0]
-	}
-
-	var s string
-	if trusted {
-		if s = ctx.GetHeader(HeaderXRealScheme); s == "" {
-			if s = ctx.GetHeader(HeaderXForwardedProto); s == "" {
-				s = ctx.GetHeader(HeaderXForwardedScheme)
-			}
-		}
-		s = strings.ToLower(s)
-	}
-
-	if s == "" {
-		if ctx.Req.TLS != nil {
-			s = "https"
-		} else {
-			s = "http"
-		}
-	}
-	return s
-}
-
-// // AcceptType returns the most preferred content type from the HTTP Accept header.
-// // If nothing accepted, then empty string is returned.
-// func (ctx *Context) AcceptType(preferred ...string) string {
-// 	return NewNegotiator(ctx.Req.Header).Type(preferred...)
-// }
-
-// // AcceptLanguage returns the most preferred language from the HTTP Accept-Language header.
-// // If nothing accepted, then empty string is returned.
-// func (ctx *Context) AcceptLanguage(preferred ...string) string {
-// 	return NewNegotiator(ctx.Req.Header).Language(preferred...)
-// }
-
-// // AcceptEncoding returns the most preferred encoding from the HTTP Accept-Encoding header.
-// // If nothing accepted, then empty string is returned.
-// func (ctx *Context) AcceptEncoding(preferred ...string) string {
-// 	return NewNegotiator(ctx.Req.Header).Encoding(preferred...)
-// }
-
-// // AcceptCharset returns the most preferred charset from the HTTP Accept-Charset header.
-// // If nothing accepted, then empty string is returned.
-// func (ctx *Context) AcceptCharset(preferred ...string) string {
-// 	return NewNegotiator(ctx.Req.Header).Charset(preferred...)
-// }
-
-// Param returns path parameter by name.
-func (ctx *Context) Param(key string) (val string) {
-	if s := CtxValue[State](ctx.ctx); s != nil && s.RouterMatched != nil {
-		val = s.RouterMatched.Params[key]
-	}
-	return
-}
-
-// Query returns the query param for the provided name.
-func (ctx *Context) Query(name string) string {
-	if ctx.query == nil {
-		ctx.query = ctx.Req.URL.Query()
-	}
-	return ctx.query.Get(name)
-}
-
-// QueryAll returns all query params for the provided name.
-func (ctx *Context) QueryAll(name string) []string {
-	if ctx.query == nil {
-		ctx.query = ctx.Req.URL.Query()
-	}
-	return ctx.query[name]
-}
-
-// ParseBody parses request content with BodyParser, stores the result in the value
-// pointed to by BodyTemplate body, and validate it.
-// DefaultBodyParser support JSON, Form and XML.
-//
-// Define a BodyTemplate type in some API:
-//
-//	type jsonBodyTemplate struct {
-//		ID   string `json:"id" form:"id"`
-//		Pass string `json:"pass" form:"pass"`
-//	}
-//
-//	func (b *jsonBodyTemplate) Validate() error {
-//		if len(b.ID) < 3 || len(b.Pass) < 6 {
-//			return ErrBadRequest.WithMsg("invalid id or pass")
-//		}
-//		return nil
-//	}
-//
-// Use it in middleware:
-//
-//	body := jsonBodyTemplate{}
-//	if err := ctx.ParseBody(&body); err != nil {
-//		return err
-//	}
-func (ctx *Context) ParseBody(body BodyTemplate) error {
-	if ctx.vira.bodyParser == nil {
-		return ViraErr.WithMsg("bodyParser not registered")
-	}
-	if ctx.Req.Body == nil {
-		return ViraErr.WithMsg("missing request body")
-	}
-
-	var err error
-	var buf []byte
-	var mediaType string
-	var encoding string
-	var params map[string]string
-
-	if mediaType = ctx.GetHeader(HeaderContentType); mediaType == "" {
-		// RFC 2616, section 7.2.1 - empty type SHOULD be treated as application/octet-stream
-		mediaType = MIMEOctetStream
-	}
-
-	ctx.SetAny("vira_REQUEST_CONTENT_TYPE", mediaType)
-	if mediaType, params, err = mime.ParseMediaType(mediaType); err != nil {
-		return ErrUnsupportedMediaType.From(err)
-	}
-
-	b := ctx.Req.Body
-	if encoding = ctx.GetHeader(HeaderContentEncoding); encoding != "" {
-		if b, err = Decompress(encoding, ctx.Req.Body); err != nil {
-			return ErrBadRequest.From(err)
-		}
-	}
-
-	reader := http.MaxBytesReader(ctx.Res, b, ctx.vira.bodyParser.MaxBytes())
-	defer reader.Close()
-
-	if buf, err = io.ReadAll(reader); err != nil {
-		// err may not be 413 Request entity too large, just make it to 413
-		return ErrRequestEntityTooLarge.From(err)
-	}
-
-	ctx.SetAny("vira_REQUEST_BODY", buf[:])
-	if err = ctx.vira.bodyParser.Parse(buf, body, mediaType, params["charset"]); err != nil {
-		return ErrBadRequest.From(err)
-	}
-	if err = body.Validate(); err != nil {
-		return ErrBadRequest.From(err)
-	}
-	return nil
-}
-
-// ParseURL parses router params (like ctx.Param) and queries (like ctx.Query) in request URL,
-// stores the result in the struct object pointed to by BodyTemplate body, and validate it.
-//
-// Define a BodyTemplate type in some API:
-//
-//	type taskTemplate struct {
-//		ID      bson.ObjectId `json:"_taskID" param:"_taskID"` // router.Get("/tasks/:_taskID", APIhandler)
-//		StartAt time.Time     `json:"startAt" query:"startAt"` // GET /tasks/50c32afae8cf1439d35a87e6?startAt=2017-05-03T10:06:45.319Z
-//	}
-//
-//	func (b *taskTemplate) Validate() error {
-//		if !b.ID.Valid() {
-//			return vira.ErrBadRequest.WithMsg("invalid task id")
-//		}
-//		if b.StartAt.IsZero() {
-//			return vira.ErrBadRequest.WithMsg("invalid task start time")
-//		}
-//		return nil
-//	}
-//
-// Use it in APIhandler:
-//
-//	body := taskTemplate{}
-//	if err := ctx.ParseURL(&body); err != nil {
-//		return err
-//	}
-func (ctx *Context) ParseURL(body BodyTemplate) error {
-	if ctx.vira.urlParser == nil {
-		return ViraErr.WithMsg("urlParser not registered")
-	}
-
-	if err := ctx.vira.urlParser.Parse(ctx.Req.URL.Query(), body, "query"); err != nil {
-		return ErrBadRequest.From(err)
-	}
-
-	// if res, _ := ctx.Any(paramsKey); res != nil {
-	if s := CtxValue[State](ctx.ctx); s != nil && s.RouterMatched != nil {
-		if len(s.RouterMatched.Params) > 0 {
-			paramValues := make(map[string][]string)
-			for k, v := range s.RouterMatched.Params {
-				paramValues[k] = []string{v}
-			}
-
-			if err := ctx.vira.urlParser.Parse(paramValues, body, "param"); err != nil {
-				return ErrBadRequest.From(err)
-			}
-		}
-	}
-
-	if err := body.Validate(); err != nil {
-		return ErrBadRequest.From(err)
-	}
-	return nil
-}
-
-// Get - Please use ctx.GetHeader instead. This method will be changed in v2.
-// func (ctx *Context) Get(key string) string {
-// 	return ctx.GetHeader(key)
-// }
-
-// Set - Please use ctx.SetHeader instead. This method will be changed in v2.
-// func (ctx *Context) Set(key, value string) {
-// 	ctx.SetHeader(key, value)
-// }
-
-// GetHeader returns the first value associated with the given key from the request Header.
-func (ctx *Context) GetHeader(key string) string {
-	switch key {
-	case "Referer", "referer", "Referrer", "referrer":
-		if val := ctx.Req.Header.Get("Referer"); val != "" {
+	if keyAsString, ok := key.(string); ok {
+		if val, exists := c.Get(keyAsString); exists {
 			return val
 		}
-		return ctx.Req.Header.Get("Referrer")
-	default:
-		return ctx.Req.Header.Get(key)
 	}
-}
-
-// GetHeaders returns all values associated with the given key from the request Header.
-func (ctx *Context) GetHeaders(key string) []string {
-	switch key {
-	case "Referer", "referer", "Referrer", "referrer":
-		if vals := ctx.Req.Header.Values("Referer"); len(vals) > 0 {
-			return vals
-		}
-		return ctx.Req.Header.Values("Referrer")
-	default:
-		return ctx.Req.Header.Values(key)
+	if !c.hasRequestContext() {
+		return nil
 	}
-}
-
-// SetHeader saves data to the response Header.
-func (ctx *Context) SetHeader(key, value string) {
-	ctx.Res.Set(key, value)
-}
-
-// Status set a status code to the response, ctx.Res.Status() returns the status code.
-func (ctx *Context) Status(code int) {
-	ctx.Res.status = code
-}
-
-// Type set a content type to the response, ctx.Res.Type() returns the content type.
-func (ctx *Context) Type(str string) {
-	ctx.Res.Set(HeaderContentType, str)
-}
-
-// HTML set an Html body with status code to response.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) HTML(code int, str string) error {
-	ctx.Type(MIMETextHTMLCharsetUTF8)
-	return ctx.End(code, []byte(str))
-}
-
-// JSON set a JSON body with status code to response.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" (if no error) and "end hooks" will run normally.
-func (ctx *Context) JSON(code int, val any) error {
-	buf, err := json.Marshal(val)
-	if err != nil {
-		return err
-	}
-	return ctx.JSONBlob(code, buf)
-}
-
-// JSONBlob set a JSON blob body with status code to response.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) JSONBlob(code int, buf []byte) error {
-	ctx.Type(MIMEApplicationJSONCharsetUTF8)
-	return ctx.End(code, buf)
-}
-
-// JSONP sends a JSONP response with status code. It uses `callback` to construct the JSONP payload.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" (if no error) and "end hooks" will run normally.
-func (ctx *Context) JSONP(code int, callback string, val any) error {
-	buf, err := json.Marshal(val)
-	if err != nil {
-		return err
-	}
-	return ctx.JSONPBlob(code, callback, buf)
-}
-
-// JSONPBlob sends a JSONP blob response with status code. It uses `callback`
-// to construct the JSONP payload.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) JSONPBlob(code int, callback string, buf []byte) error {
-	ctx.Type(MIMEApplicationJavaScriptCharsetUTF8)
-	ctx.SetHeader(HeaderXContentTypeOptions, "nosniff")
-	// the /**/ is a specific security mitigation for "Rosetta Flash JSONP abuse"
-	// @see http://miki.it/blog/2014/7/8/abusing-jsonp-with-rosetta-flash/
-	// the typeof check is just to reduce client error noise
-	b := []byte(fmt.Sprintf(`/**/ typeof %s === "function" && %s(`, callback, callback))
-	b = append(b, buf...)
-	return ctx.End(code, append(b, ')', ';'))
-}
-
-// XML set an XML body with status code to response.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" (if no error) and "end hooks" will run normally.
-func (ctx *Context) XML(code int, val any) error {
-	buf, err := xml.Marshal(val)
-	if err != nil {
-		return err
-	}
-	return ctx.XMLBlob(code, buf)
-}
-
-// XMLBlob set a XML blob body with status code to response.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) XMLBlob(code int, buf []byte) error {
-	ctx.Type(MIMEApplicationXMLCharsetUTF8)
-	return ctx.End(code, buf)
-}
-
-// Send handle code and data with Sender interface.
-// Sender can be registered using `app.Set(vira.SetSender, someSender)`.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" (if no error) and "end hooks" will run normally.
-// You can define a custom send function like this:
-//
-//	 type mySenderT struct{}
-//
-//	 func (s *mySenderT) Send(ctx *Context, code int, data any) error {
-//		 switch v := data.(type) {
-//		 case []byte:
-//	 		ctx.Type(MIMETextPlainCharsetUTF8)
-//	 		return ctx.End(code, v)
-//	 	case string:
-//	 		return ctx.HTML(code, v)
-//	 	case error:
-//	 		return ctx.Error(v)
-//	 	default:
-//	 		return ctx.JSON(code, data)
-//	 	}
-//	 }
-//
-//	 app.Set(vira.SetSender, &mySenderT{})
-//	 app.Use(func(ctx *Context) error {
-//	 	switch ctx.Path {
-//	 	case "/text":
-//	 		return ctx.Send(http.StatusOK, []byte("Hello, vira!"))
-//	 	case "/html":
-//	 		return ctx.Send(http.StatusOK, "<h1>Hello, vira!</h1>")
-//	 	case "/error":
-//	 		return ctx.Send(http.StatusOK, Err.WithMsg("some error"))
-//	 	default:
-//	 		return ctx.Send(http.StatusOK, map[string]string{"value": "Hello, vira!"})
-//	 	}
-//	 })
-func (ctx *Context) Send(code int, data any) (err error) {
-	if ctx.vira.sender == nil {
-		return ViraErr.WithMsg("sender not registered")
-	}
-	return ctx.vira.sender.Send(ctx, code, data)
-}
-
-// Render renders a template with data and sends a text/html response with status
-// code. Templates can be registered using `app.Set(vira.SetRenderer, someRenderer)`.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" (if no error) and "end hooks" will run normally.
-func (ctx *Context) Render(code int, name string, data any) (err error) {
-	if ctx.vira.renderer == nil {
-		return ViraErr.WithMsg("renderer not registered")
-	}
-	buf := new(bytes.Buffer)
-	if err = ctx.vira.renderer.Render(ctx, buf, name, data); err == nil {
-		ctx.Type(MIMETextHTMLCharsetUTF8)
-		return ctx.End(code, buf.Bytes())
-	}
-	return
-}
-
-// Stream sends a streaming response with status code and content type.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) Stream(code int, contentType string, r io.Reader) (err error) {
-	if ctx.Res.ended.swapTrue() {
-		ctx.Status(code)
-		ctx.Type(contentType)
-		_, err = io.Copy(ctx.Res, r)
-	} else {
-		err = ErrInternalServerError.WithMsg("request ended before ctx.Stream")
-	}
-	return
-}
-
-// Attachment sends a response from `io.ReaderSeeker` as attachment, prompting
-// client to save the file. If inline is true, the attachment will sends as inline,
-// opening the file in the browser.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) Attachment(name string, modtime time.Time, content io.ReadSeeker, inline ...bool) (err error) {
-	if ctx.Res.ended.swapTrue() {
-		dispositionType := "attachment"
-		if len(inline) > 0 && inline[0] {
-			dispositionType = "inline"
-		}
-		ctx.SetHeader(HeaderContentDisposition, ContentDisposition(name, dispositionType))
-		http.ServeContent(ctx.Res, ctx.Req, name, modtime, content)
-	} else {
-		err = ErrInternalServerError.WithMsg("request ended before ctx.Attachment")
-	}
-	return
-}
-
-// Redirect redirects the request with status code 302.
-// You can use other status code with ctx.Status method, It is a wrap of http.Redirect.
-// It will end the ctx. The middlewares after current middleware will not run.
-// "after hooks" and "end hooks" will run normally.
-func (ctx *Context) Redirect(url string) (err error) {
-	if ctx.Res.ended.swapTrue() {
-		if !isRedirectStatus(ctx.Res.status) {
-			ctx.Res.status = http.StatusFound
-		}
-		http.Redirect(ctx.Res, ctx.Req, url, ctx.Res.status)
-	} else {
-		err = ErrInternalServerError.WithMsg("request ended before ctx.Redirect")
-	}
-	return
-}
-
-// OkHTML is a wrap of ctx.HTML with http.StatusOK
-func (ctx *Context) OkHTML(str string) error {
-	return ctx.HTML(http.StatusOK, str)
-}
-
-// OkJSON is a wrap of ctx.JSON with http.StatusOK
-//
-//	ctx.OkJSON(struct{}{})
-func (ctx *Context) OkJSON(val any) error {
-	return ctx.JSON(http.StatusOK, val)
-}
-
-// OkXML is a wrap of ctx.XML with http.StatusOK
-func (ctx *Context) OkXML(val any) error {
-	return ctx.XML(http.StatusOK, val)
-}
-
-// OkSend is a wrap of ctx.Send with http.StatusOK
-func (ctx *Context) OkSend(val any) error {
-	return ctx.Send(http.StatusOK, val)
-}
-
-// OkRender is a wrap of ctx.Render with http.StatusOK
-func (ctx *Context) OkRender(name string, val any) error {
-	return ctx.Render(http.StatusOK, name, val)
-}
-
-// OkStream is a wrap of ctx.Stream with http.StatusOK
-func (ctx *Context) OkStream(contentType string, r io.Reader) error {
-	return ctx.Stream(http.StatusOK, contentType, r)
-}
-
-// Error send a error with application/json type to response.
-// It will not trigger vira.SetOnError hook.
-// It will end the ctx. The middlewares after current middleware and "after hooks" will not run,
-// but "end hooks" will run normally.
-func (ctx *Context) Error(e error) error {
-	ctx.Res.afterHooks = nil // clear afterHooks when any error
-	ctx.Res.ResetHeader()
-	err := ctx.vira.parseError(e)
-	if err == nil {
-		err = ErrInternalServerError.WithMsg("nil error")
-	}
-	ctx.respondError(err)
-	return nil
-}
-
-// ErrorStatus send a error by status code to response.
-// It is sugar of ctx.Error
-func (ctx *Context) ErrorStatus(status int) error {
-	if status >= 400 && IsStatusCode(status) {
-		return ctx.Error(ErrByStatus(status))
-	}
-	return ErrInternalServerError.WithMsg("invalid error status")
-}
-
-// End end the ctx with bytes and status code optionally.
-// After it's called, the rest of middleware handles will not run.
-// But "after hooks" and "end hooks" will run normally.
-func (ctx *Context) End(code int, buf ...[]byte) (err error) {
-	if ctx.Res.ended.swapTrue() {
-		var body []byte
-		if len(buf) > 0 {
-			body = buf[0]
-		}
-		err = ctx.Res.respond(code, body)
-	} else {
-		err = ErrInternalServerError.WithMsg("request ended before ctx.End")
-	}
-	return
-}
-
-// After add a "after hook" to the ctx that will run after middleware process,
-// but before Response.WriteHeader. So it will block response writing.
-func (ctx *Context) After(hook func()) {
-	if ctx.Res.wroteHeader.isTrue() {
-		panic(ViraErr.WithMsg(`can't add "after hook" after header wrote`))
-	}
-	ctx.Res.afterHooks = append(ctx.Res.afterHooks, hook)
-}
-
-// OnEnd add a "end hook" to the ctx that will run after Response.WriteHeader.
-// They run in a goroutine and will not block response.
-// Take care that http.ResponseWriter and http.Request maybe reset for reusing.
-func (ctx *Context) OnEnd(hook func()) {
-	if ctx.Res.wroteHeader.isTrue() {
-		panic(ViraErr.WithMsg(`can't add "end hook" after header wrote`))
-	}
-	ctx.Res.endHooks = append(ctx.Res.endHooks, hook)
-}
-
-func (ctx *Context) respondError(err HTTPError) {
-	if !ctx.Res.wroteHeader.isTrue() {
-		code, contentType, body := ctx.vira.renderError(err)
-		if !IsStatusCode(code) && ctx.Res.status != 0 {
-			code = ctx.Res.status
-		}
-		// we don't need to logging 501 and 4xx errors
-		if code == 500 || code > 501 || code < 400 {
-			ctx.vira.Error(err)
-		}
-
-		ctx.SetHeader(HeaderXContentTypeOptions, "nosniff")
-		ctx.SetHeader(HeaderContentType, contentType)
-		ctx.Res.respond(code, body)
-	}
-}
-
-// func (ctx *Context) handleCompress() (cw *compressWriter) {
-// 	if ctx.app.compress != nil && ctx.Method != http.MethodHead && ctx.Method != http.MethodOptions {
-// 		if cw = newCompress(ctx.Res, ctx.app.compress, ctx.AcceptEncoding("gzip", "deflate")); cw != nil {
-// 			ctx.Res.rw = cw // override with http.ResponseWriter wrapper.
-// 		}
-// 	}
-// 	return
-// }
-
-func catchTiming(ch chan error) {
-	defer close(ch)
-	// recover the fn call
-	if e := recover(); e != nil {
-		ch <- ErrInternalServerError.WithMsgf("Timing panic: %#v", e)
-	}
-}
-
-func tryRunTiming(ct context.Context, fn func(context.Context), ch chan error) {
-	defer catchTiming(ch)
-	fn(ct)
+	return c.Request.Context().Value(key)
 }
